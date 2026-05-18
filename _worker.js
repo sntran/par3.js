@@ -311,6 +311,38 @@ async function writeMultipartResponse(writer, responseBoundary, codec, missingIn
   await writer.write(encodeClosingBoundary(responseBoundary));
 }
 
+async function processRepairPipeline(
+  request,
+  requestBoundary,
+  responseBoundary,
+  layout,
+  codec,
+  writable,
+) {
+  const writer = writable.getWriter();
+
+  try {
+    const missingIndices = await ingestMultipartRequest({
+      request,
+      requestBoundary,
+      codec,
+      requestedMissingIndices: layout.requestedMissingIndices,
+    });
+
+    if (missingIndices.length !== 0) {
+      codec.repair();
+    }
+
+    await writeMultipartResponse(writer, responseBoundary, codec, missingIndices);
+    await writer.close();
+  } catch (error) {
+    await writer.abort(error).catch(() => undefined);
+    throw error;
+  } finally {
+    writer.releaseLock();
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     void env;
@@ -340,72 +372,34 @@ export default {
       const responseBoundary = `par3-${crypto.randomUUID()}`;
       const codec = new Par3(layout, { createError: badRequest });
       const { readable, writable } = new TransformStream();
-      const reader = readable.getReader();
-      let release = () => {
-        reader.releaseLock();
-        codec.free();
-        release = () => {};
-      };
-      const response = new Response(new ReadableStream({
-        async pull(controller) {
-          try {
-            const { done, value } = await reader.read();
-            if (done) {
-              release();
-              controller.close();
-              return;
-            }
-
-            controller.enqueue(value);
-          } catch (error) {
-            release();
-            controller.error(error);
-          }
+      const cleanupTransform = new TransformStream({
+        flush() {
+          codec.free();
         },
-        async cancel(reason) {
-          try {
-            await reader.cancel(reason);
-          } catch {
-          } finally {
-            release();
-          }
+        cancel() {
+          codec.free();
         },
-      }), {
+      });
+      const response = new Response(readable.pipeThrough(cleanupTransform), {
         status: 200,
         headers: {
           "cache-control": "no-store",
           "content-type": `multipart/form-data; boundary=${responseBoundary}`,
         },
       });
-      const background = (async () => {
-        const writer = writable.getWriter();
-
-        try {
-          const missingIndices = await ingestMultipartRequest({
-            request,
-            requestBoundary,
-            codec,
-            requestedMissingIndices: layout.requestedMissingIndices,
-          });
-
-          if (missingIndices.length !== 0) {
-            codec.repair();
-          }
-
-          await writeMultipartResponse(writer, responseBoundary, codec, missingIndices);
-          await writer.close();
-        } catch (error) {
-          await writer.abort(error).catch(() => undefined);
-          throw error;
-        } finally {
-          writer.releaseLock();
-        }
-      })();
+      const backgroundPromise = processRepairPipeline(
+        request,
+        requestBoundary,
+        responseBoundary,
+        layout,
+        codec,
+        writable,
+      );
 
       if (typeof ctx?.waitUntil === "function") {
-        ctx.waitUntil(background);
+        ctx.waitUntil(backgroundPromise);
       } else {
-        void background.catch(() => undefined);
+        void backgroundPromise.catch(() => undefined);
       }
 
       return response;

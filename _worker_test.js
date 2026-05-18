@@ -742,9 +742,15 @@ test("maps non-Error request stream failures to 400", async () => {
 
 test("ignores response writer abort failures when ingress parsing rejects", { concurrency: false }, async () => {
   const originalTransformStream = globalThis.TransformStream;
+  let streamConstructionCount = 0;
 
   globalThis.TransformStream = class MockTransformStream {
-    constructor() {
+    constructor(transformer, writableStrategy, readableStrategy) {
+      streamConstructionCount += 1;
+      if (streamConstructionCount > 1) {
+        return new originalTransformStream(transformer, writableStrategy, readableStrategy);
+      }
+
       const stream = new originalTransformStream();
 
       return {
@@ -1257,6 +1263,7 @@ test("releases response resources even when the readable cancel hook rejects", {
   const originalFree = Par3.prototype.free;
   const freeDone = Promise.withResolvers();
   let freeCalls = 0;
+  let streamConstructionCount = 0;
 
   t.mock.method(Par3.prototype, "free", function mockFree(...args) {
     freeCalls += 1;
@@ -1265,7 +1272,12 @@ test("releases response resources even when the readable cancel hook rejects", {
   });
 
   globalThis.TransformStream = class MockTransformStream {
-    constructor() {
+    constructor(transformer, writableStrategy, readableStrategy) {
+      streamConstructionCount += 1;
+      if (streamConstructionCount > 1) {
+        return new originalTransformStream(transformer, writableStrategy, readableStrategy);
+      }
+
       return {
         readable: new ReadableStream({
           cancel() {
