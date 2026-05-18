@@ -1,0 +1,6 @@
+node_modules/
+pkg/
+target/
+.wrangler/
+.dev.vars*
+.env*

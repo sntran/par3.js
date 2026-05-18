@@ -1,0 +1,22 @@
+name = "par3"
+main = "_worker.js"
+compatibility_date = "2026-05-17"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+find_additional_modules = true
+base_dir = "."
+minify = false
+
+[observability]
+enabled = true
+
+[limits]
+cpu_ms = 300000
+
+[build]
+command = "npm run build:wasm"
+watch_dir = ["src", "scripts", "Cargo.toml", "_worker.js", "tests"]
+
+[[rules]]
+type = "CompiledWasm"
+globs = ["pkg/*.wasm"]
