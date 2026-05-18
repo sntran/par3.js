@@ -28,6 +28,11 @@ struct U32BufferMeta {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Generation-tagged handle for a live allocation inside wasm linear memory.
+///
+/// The low 32 bits encode a stable slot identifier and the high 32 bits encode that slot's
+/// generation counter. Reusing a registry slot always bumps the generation, so stale handles stop
+/// resolving even if a later allocation reuses the same slot or raw pointer address.
 pub struct AllocationHandle(u64);
 
 impl AllocationHandle {
@@ -287,6 +292,10 @@ impl AllocationRegistry {
     }
 }
 
+/// Shared registry guarding every live allocation exported across the wasm boundary.
+///
+/// The registry maps generation-tagged handles to the current pointer plus allocation metadata, and
+/// the mutex keeps registration, lookup, and removal atomic across JavaScript/Wasm entrypoints.
 type Registry = Mutex<AllocationRegistry>;
 
 fn allocation_registry() -> &'static Registry {
@@ -396,6 +405,11 @@ fn free_u32_buffer_inner(handle: AllocationHandle) -> Result<(), RepairError> {
     }
 }
 
+/// Resolve a registered shard-arena handle and expose its current bytes to `f`.
+///
+/// Handle lookup validates both the slot identifier and generation tag before reconstructing the
+/// mutable slice, which prevents stale JavaScript handles from writing through freed or recycled
+/// allocations.
 fn with_registered_arena_mut<T>(
     handle: AllocationHandle,
     f: impl FnOnce(ShardArenaMeta, &mut [u8]) -> Result<T, RepairError>,
@@ -415,6 +429,10 @@ fn with_registered_arena_mut<T>(
     f(meta, bytes)
 }
 
+/// Resolve a registered `u32` buffer handle and expose an immutable slice to `f`.
+///
+/// The generation-tagged handle check ensures callers only read from the live buffer associated
+/// with the current registration, even when allocator reuse would otherwise recycle the address.
 fn with_registered_u32_slice<T>(
     handle: AllocationHandle,
     len: usize,

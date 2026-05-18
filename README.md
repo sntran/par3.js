@@ -9,24 +9,29 @@ Cloudflare's `nodejs_compat` compatibility layer.
 
 ## Overview
 
-The repository has four main layers:
+The repository has five main layers:
 
 1. `src/lib.rs`
    Rust manages shard arenas in wasm linear memory and performs encode/repair operations.
-2. `lib/mod.js`
-   The shared `Par3` class owns shard-layout validation, arena growth, in-place repair, and shard
-   extraction for both runtime entrypoints.
-3. `_worker.js`
-  The Worker reads layout metadata from URL search params, streams binary shard parts directly
-  into wasm memory, and starts the multipart repair response as soon as the repair threshold is
-  met under Cloudflare's `nodejs_compat` layer.
-4. `bin/main.js`
+2. `lib/multipart.js`
+  Generic RFC 7578 multipart decoder/encoder utilities used by the Worker request path and the
+  protocol-focused test suite.
+3. `lib/mod.js`
+  The shared `Par3` class owns shard-layout validation, arena growth, in-place repair, and shard
+  extraction for both runtime entrypoints.
+4. `_worker.js`
+  The Worker reads layout metadata from URL search params, returns a streaming response
+  immediately, ingests binary shard parts directly into wasm memory in the background, and aborts
+  the response stream if a late ingress or repair error occurs under Cloudflare's `nodejs_compat`
+  layer.
+5. `bin/main.js`
   The local CLI exposes `create` and `repair` subcommands that read shard files from disk and
   write recovery or repaired output shards into an output directory.
 
 ## Features
 
 - Streaming multipart request handling in the Worker
+- Generic RFC 7578 multipart parsing and encoding in `lib/multipart.js`
 - In-place encode and repair over wasm linear memory
 - Shared `Par3` runtime used by both the Worker and the CLI
 - Built-in `create` and `repair` subcommands with `par3cmdline`-style `-n`, `-r`, and `-s` flags
@@ -82,7 +87,8 @@ npm run test:coverage
 ```
 
 This command uses Node's built-in test coverage output plus a repository-local coverage gate to
-enforce 100% line, branch, and function coverage for `_worker.js`, `bin/main.js`, and `lib/mod.js`.
+enforce 100% line, branch, and function coverage for `_worker.js`, `bin/main.js`, `lib/mod.js`,
+and `lib/multipart.js`.
 
 ## Worker request contract
 
@@ -132,12 +138,12 @@ Important runtime rule:
 - If `digests` are provided, every received shard is verified before it is committed to the repair
   set.
 - The body must remain binary-only: only `digests` and `shard_<slotIndex>` parts are accepted.
+- The Worker returns the multipart response headers immediately; if ingress or repair fails after
+  that point, the response body aborts and the client sees a stream-level failure rather than a
+  late JSON error payload.
 
 Worker compatibility is declared explicitly in `wrangler.toml` via
 `compatibility_flags = ["nodejs_compat"]`.
-
-Successful repair responses also include `x-par3-repaired-count` with the number of returned shard
-parts.
 
 That distinction is what keeps reconstruction correct when clients intentionally omit extra recovery
 shards they do not need returned.
@@ -246,8 +252,9 @@ After both sides are in raw shard form, `par3 create` and `par3 repair` work on 
 ## Project layout
 
 - `src/lib.rs`: Rust codec core and wasm bindings
+- `lib/multipart.js`: generic RFC 7578 multipart protocol helpers
 - `lib/mod.js`: shared `Par3` shard repair/runtime abstraction
-- `_worker.js`: Cloudflare Worker streaming repair pipeline
+- `_worker.js`: Cloudflare Worker immediate-return repair orchestration and stream lifetime management
 - `bin/main.js`: local CLI implementation and executable entrypoint
 - `_worker_test.js`: Worker property-style and protocol tests
 - `bin/main_test.js`: CLI behavior tests

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import worker from "./_worker.js";
-import { MultipartTransformStream, parseMultipartBoundary } from "./lib/multipart.js";
+import { MultipartDecoder, parseMultipartBoundary } from "./lib/multipart.js";
 import { Par3 } from "./lib/mod.js";
 import * as wasmModule from "./pkg/par3_bg.wasm";
 import { alloc_shard_arena, free_shard_arena, leopard_encode, shard_arena_ptr } from "./pkg/par3.js";
@@ -297,7 +297,7 @@ function createPullMultipart(
       controller.enqueue(chunk.bytes);
     },
     cancel(reason) {
-      onCancel(reason);
+      return onCancel(reason);
     },
   });
 }
@@ -364,10 +364,6 @@ async function buildRecoveryShards(originalShards, recoveryCount) {
 }
 
 async function collectResponseParts(response) {
-  if (response.status === 204) {
-    return [];
-  }
-
   const boundary = parseMultipartBoundary(response.headers.get("content-type"));
   const boundaryBytes = encoder.encode(`--${boundary}`);
   const partBoundary = encoder.encode(`\r\n--${boundary}`);
@@ -376,6 +372,17 @@ async function collectResponseParts(response) {
 
   assert.equal(startsWithBytes(buffer, boundaryBytes), true);
   buffer = buffer.subarray(boundaryBytes.byteLength);
+
+   if (startsWithBytes(buffer, DASH_DASH)) {
+    buffer = buffer.subarray(DASH_DASH.byteLength);
+    if (startsWithBytes(buffer, CRLF)) {
+      buffer = buffer.subarray(CRLF.byteLength);
+    }
+
+    assert.equal(buffer.byteLength, 0);
+    return parts;
+  }
+
   assert.equal(startsWithBytes(buffer, CRLF), true);
   buffer = buffer.subarray(CRLF.byteLength);
 
@@ -410,6 +417,11 @@ async function collectResponseParts(response) {
   }
 
   return parts;
+}
+
+async function assertMultipartStreamFailure(response, pattern) {
+  assert.equal(response.status, 200);
+  await assert.rejects(() => readStream(response.body), pattern);
 }
 
 async function invokeMultipart(parts, seed, { searchParams = defaultWorkerSearchParams() } = {}) {
@@ -541,10 +553,6 @@ test("repairs requested missing shards across deterministic streamed cases", asy
       const repairedParts = await collectResponseParts(response);
 
       assert.equal(response.status, 200);
-      assert.equal(
-        response.headers.get("x-par3-repaired-count"),
-        String(testCase.requestedMissingIndices.length),
-      );
       assert.deepEqual(
         repairedParts.map((part) => part.name),
         testCase.requestedMissingIndices.map((index) => `shard_${index}`),
@@ -557,16 +565,40 @@ test("repairs requested missing shards across deterministic streamed cases", asy
   }
 });
 
-test("returns 204 when omitted shards are not requested outputs", async (t) => {
+test("streams an empty multipart response when omitted shards are not requested outputs", async (t) => {
   for (let seed = 101; seed <= 116; seed += 1) {
     await t.test(`seed ${seed}`, async () => {
       const testCase = await createRepairCase(seed, "none");
       const response = await invokeWorker(testCase.parts, testCase.metadata, seed);
 
-      assert.equal(response.status, 204);
-      assert.equal(await response.text(), "");
+      assert.equal(response.status, 200);
+      assert.deepEqual(await collectResponseParts(response), []);
     });
   }
+});
+
+test("streams an empty multipart response when requested outputs are already present", async () => {
+  const originalShards = [
+    Uint8Array.from([0, 1, 2, 3]),
+    Uint8Array.from([4, 5, 6, 7]),
+  ];
+  const recoveryShards = await buildRecoveryShards(originalShards, 1);
+  const response = await invokeWorker(
+    [
+      buildPart("shard_1", originalShards[1]),
+      buildPart("shard_2", recoveryShards[0]),
+    ],
+    {
+      original_count: 2,
+      recovery_count: 1,
+      shard_size: 4,
+      missing_indices: [1],
+    },
+    120,
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await collectResponseParts(response), []);
 });
 
 test("returns 400 when required query parameters are missing", async () => {
@@ -590,8 +622,7 @@ test("rejects unexpected metadata parts in strict binary mode", async () => {
     141,
   );
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /unexpected multipart part metadata/);
+  await assertMultipartStreamFailure(response, /unexpected multipart part metadata/);
 });
 
 test("rejects duplicate shard parts", async () => {
@@ -609,8 +640,34 @@ test("rejects duplicate shard parts", async () => {
     211,
   );
 
-  assert.equal(response.status, 409);
-  assert.match((await response.json()).error, /duplicate shard part received/);
+  await assertMultipartStreamFailure(response, /duplicate shard part received/);
+});
+
+test("rejects shard part names with invalid slot indexes", async () => {
+  const invalidPartName = "shard_9007199254740992";
+  const response = await invokeMultipart(
+    [
+      {
+        name: invalidPartName,
+        contentType: "application/octet-stream",
+        body: Uint8Array.from([0, 1, 2, 3]),
+      },
+    ],
+    212,
+    {
+      searchParams: createLayoutSearchParams({
+        original_count: 1,
+        recovery_count: 1,
+        shard_size: 4,
+        missing_indices: [1],
+      }),
+    },
+  );
+
+  await assertMultipartStreamFailure(
+    response,
+    new RegExp(`${invalidPartName} must be an integer greater than or equal to 0`),
+  );
 });
 
 test("rejects requests that never reach the repair threshold", async () => {
@@ -625,8 +682,7 @@ test("rejects requests that never reach the repair threshold", async () => {
     307,
   );
 
-  assert.equal(response.status, 422);
-  assert.match((await response.json()).error, /repair threshold not reached/);
+  await assertMultipartStreamFailure(response, /repair threshold not reached/);
 });
 
 test("maps malformed multipart bodies to 400", async () => {
@@ -643,7 +699,10 @@ test("maps malformed multipart bodies to 400", async () => {
     {},
   );
 
-  assert.equal(response.status, 400);
+  await assertMultipartStreamFailure(
+    response,
+    /multipart body does not start with the declared boundary/,
+  );
 });
 
 test("rejects multipart bodies that terminate before the first boundary", async () => {
@@ -652,8 +711,7 @@ test("rejects multipart bodies that terminate before the first boundary", async 
     body: "",
   });
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /multipart body terminated before the first boundary/);
+  await assertMultipartStreamFailure(response, /multipart body terminated before the first boundary/);
 });
 
 test("maps request stream read failures to 400", async () => {
@@ -666,8 +724,7 @@ test("maps request stream read failures to 400", async () => {
     }),
   });
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /forced multipart parse failure/);
+  await assertMultipartStreamFailure(response, /forced multipart parse failure/);
 });
 
 test("maps non-Error request stream failures to 400", async () => {
@@ -680,8 +737,56 @@ test("maps non-Error request stream failures to 400", async () => {
     }),
   });
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /forced string parse failure/);
+  await assertMultipartStreamFailure(response, /forced string parse failure/);
+});
+
+test("ignores response writer abort failures when ingress parsing rejects", { concurrency: false }, async () => {
+  const originalTransformStream = globalThis.TransformStream;
+
+  globalThis.TransformStream = class MockTransformStream {
+    constructor() {
+      const stream = new originalTransformStream();
+
+      return {
+        readable: stream.readable,
+        writable: {
+          getWriter() {
+            const writer = stream.writable.getWriter();
+
+            return {
+              abort(reason) {
+                void writer.abort(reason);
+                return Promise.reject(new Error("forced abort failure"));
+              },
+              close() {
+                return writer.close();
+              },
+              releaseLock() {
+                writer.releaseLock();
+              },
+              write(chunk) {
+                return writer.write(chunk);
+              },
+            };
+          },
+        },
+      };
+    }
+  };
+
+  try {
+    const response = await invokeRawRequest({
+      contentType: "multipart/form-data; boundary=broken",
+      body: "not a multipart body",
+    });
+
+    await assertMultipartStreamFailure(
+      response,
+      /multipart body does not start with the declared boundary/,
+    );
+  } finally {
+    globalThis.TransformStream = originalTransformStream;
+  }
 });
 
 test("validates multipart content-type boundaries before reading the body", async (t) => {
@@ -778,8 +883,7 @@ test("rejects malformed multipart headers during direct request parsing", async 
         body: testCase.body,
       });
 
-      assert.equal(response.status, 400);
-      assert.match((await response.json()).error, testCase.pattern);
+      await assertMultipartStreamFailure(response, testCase.pattern);
     });
   }
 });
@@ -805,8 +909,7 @@ test("rejects digests parts that arrive after shard parts", async () => {
     },
   );
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /digests part must arrive before shard parts/);
+  await assertMultipartStreamFailure(response, /digests part must arrive before shard parts/);
 });
 
 test("accepts unquoted content-disposition parameters", async () => {
@@ -899,8 +1002,7 @@ test("rejects truncated or oversized multipart parser states", async (t) => {
         body: testCase.body,
       });
 
-      assert.equal(response.status, 400);
-      assert.match((await response.json()).error, testCase.pattern);
+      await assertMultipartStreamFailure(response, testCase.pattern);
     });
   }
 });
@@ -912,8 +1014,7 @@ test("accepts a multipart stream that closes immediately with the final boundary
     body: `--${boundary}--\r\n`,
   });
 
-  assert.equal(response.status, 422);
-  assert.match((await response.json()).error, /repair threshold not reached/);
+  await assertMultipartStreamFailure(response, /repair threshold not reached/);
 });
 
 test("accepts an immediate final boundary without a trailing CRLF", async () => {
@@ -923,8 +1024,7 @@ test("accepts an immediate final boundary without a trailing CRLF", async () => 
     body: `--${boundary}--`,
   });
 
-  assert.equal(response.status, 422);
-  assert.match((await response.json()).error, /repair threshold not reached/);
+  await assertMultipartStreamFailure(response, /repair threshold not reached/);
 });
 
 test("accepts a final multipart boundary without a trailing CRLF", async () => {
@@ -999,8 +1099,7 @@ test("rejects duplicate digests parts", async () => {
     },
   );
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /digests part may only appear once/);
+  await assertMultipartStreamFailure(response, /digests part may only appear once/);
 });
 
 test("rejects undersized digests parts", async () => {
@@ -1009,8 +1108,7 @@ test("rejects undersized digests parts", async () => {
     421,
   );
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /digests must contain exactly 2 contiguous 32-byte hashes/);
+  await assertMultipartStreamFailure(response, /digests must contain exactly 2 contiguous 32-byte hashes/);
 });
 
 test("rejects oversized shard parts", async () => {
@@ -1025,8 +1123,7 @@ test("rejects oversized shard parts", async () => {
     430,
   );
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /exceeds declared shard_size 4/);
+  await assertMultipartStreamFailure(response, /exceeds declared shard_size 4/);
 });
 
 test("rejects undersized shard parts", async () => {
@@ -1041,8 +1138,7 @@ test("rejects undersized shard parts", async () => {
     431,
   );
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /wrote 2 bytes but shard_size is 4/);
+  await assertMultipartStreamFailure(response, /wrote 2 bytes but shard_size is 4/);
 });
 
 test("rejects worker requests without a locked slot count", async () => {
@@ -1085,8 +1181,7 @@ test("rejects shard indexes outside a declared total_shard_count", async () => {
     441,
   );
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /outside declared total_shard_count/);
+  await assertMultipartStreamFailure(response, /outside declared total_shard_count/);
 });
 
 test("rejects POST requests without a body", async () => {
@@ -1109,7 +1204,7 @@ test("rejects POST requests without a body", async () => {
 
 test("rejects invalid layouts before allocating or reading request bytes", { concurrency: false }, async (t) => {
   const originalAllocShardArena = Par3.bindings.alloc_shard_arena;
-  const originalCreateTransform = MultipartTransformStream.create;
+  const originalCreateDecoder = MultipartDecoder.create;
   let allocCalls = 0;
   let createCalls = 0;
   const body = new ReadableStream({
@@ -1136,9 +1231,9 @@ test("rejects invalid layouts before allocating or reading request bytes", { con
     allocCalls += 1;
     return originalAllocShardArena(...args);
   });
-  t.mock.method(MultipartTransformStream, "create", (...args) => {
+  t.mock.method(MultipartDecoder, "create", (...args) => {
     createCalls += 1;
-    return originalCreateTransform(...args);
+    return originalCreateDecoder(...args);
   });
 
   const response = await worker.fetch(request, {}, {});
@@ -1155,6 +1250,161 @@ test("releases response resources when the caller cancels a multipart response",
 
   assert.equal(response.status, 200);
   await response.body.cancel();
+});
+
+test("releases response resources even when the readable cancel hook rejects", { concurrency: false }, async (t) => {
+  const originalTransformStream = globalThis.TransformStream;
+  const originalFree = Par3.prototype.free;
+  const freeDone = Promise.withResolvers();
+  let freeCalls = 0;
+
+  t.mock.method(Par3.prototype, "free", function mockFree(...args) {
+    freeCalls += 1;
+    freeDone.resolve();
+    return originalFree.apply(this, args);
+  });
+
+  globalThis.TransformStream = class MockTransformStream {
+    constructor() {
+      return {
+        readable: new ReadableStream({
+          cancel() {
+            return Promise.reject(new Error("forced readable cancel failure"));
+          },
+        }),
+        writable: {
+          getWriter() {
+            return {
+              abort() {
+                return Promise.resolve();
+              },
+              close() {
+                return Promise.resolve();
+              },
+              releaseLock() {},
+              write() {
+                return Promise.resolve();
+              },
+            };
+          },
+        },
+      };
+    }
+  };
+
+  try {
+    const response = await invokeWorker(
+      [buildPart("shard_0", Uint8Array.from([0, 1, 2, 3]))],
+      {
+        original_count: 1,
+        recovery_count: 1,
+        shard_size: 4,
+        missing_indices: [1],
+      },
+      4501,
+    );
+
+    assert.equal(response.status, 200);
+    await response.body.cancel();
+    await freeDone.promise;
+    assert.equal(freeCalls, 1);
+  } finally {
+    globalThis.TransformStream = originalTransformStream;
+  }
+});
+
+test("keeps wasm-backed response bytes alive until a slow consumer finishes reading", { concurrency: false }, async (t) => {
+  const originalRepair = Par3.prototype.repair;
+  const originalFree = Par3.prototype.free;
+  const repairDone = Promise.withResolvers();
+  let freeCalls = 0;
+
+  t.mock.method(Par3.prototype, "repair", function mockRepair(...args) {
+    const result = originalRepair.apply(this, args);
+    repairDone.resolve();
+    return result;
+  });
+
+  t.mock.method(Par3.prototype, "free", function mockFree(...args) {
+    freeCalls += 1;
+    if (this.arenaPtr !== 0 && this.arenaSlotCount !== 0) {
+      this.memoryView(this.arenaPtr, this.arenaSlotCount * this.shardSize).fill(0);
+    }
+
+    return originalFree.apply(this, args);
+  });
+
+  const originalShards = [
+    Uint8Array.from([0, 1, 2, 3]),
+    Uint8Array.from([4, 5, 6, 7]),
+  ];
+  const recoveryShards = await buildRecoveryShards(originalShards, 1);
+  const response = await worker.fetch(
+    new Request(createWorkerUrl({
+      original_count: 2,
+      recovery_count: 1,
+      shard_size: 4,
+      missing_indices: [1],
+    }), {
+      method: "POST",
+      headers: {
+        "content-type": "multipart/form-data; boundary=----par3-slow-consumer",
+      },
+      body: encodeMultipartBytes([
+        buildPart("shard_0", originalShards[0]),
+        buildPart("shard_2", recoveryShards[0]),
+      ], "----par3-slow-consumer"),
+      duplex: "half",
+    }),
+    {},
+    {},
+  );
+
+  assert.equal(response.status, 200);
+
+  const slowBytesPromise = (async () => {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let totalLength = 0;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        chunks.push(Uint8Array.from(value));
+        totalLength += value.byteLength;
+        await wait(10);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const merged = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    return merged;
+  })();
+
+  await repairDone.promise;
+  assert.equal(freeCalls, 0);
+
+  const slowBytes = await slowBytesPromise;
+  const repairedParts = await collectResponseParts(new Response(slowBytes, {
+    headers: {
+      "content-type": response.headers.get("content-type"),
+    },
+  }));
+
+  assert.deepEqual(repairedParts.map((part) => part.name), ["shard_1"]);
+  assert.deepEqual(repairedParts[0].bytes, originalShards[1]);
+  assert.equal(freeCalls, 1);
 });
 
 test("releases response resources when streaming a shard throws", { concurrency: false }, async (t) => {
@@ -1188,8 +1438,81 @@ test("rejects oversized digests parts before buffering them entirely", async () 
     },
   );
 
-  assert.equal(response.status, 413);
-  assert.match((await response.json()).error, /digests exceeds expected size of 96 bytes/);
+  await assertMultipartStreamFailure(response, /digests exceeds expected size of 96 bytes/);
+});
+
+test("accepts decoder body chunks that are views, ArrayBuffers, and array-like values", { concurrency: false }, async (t) => {
+  const originalShards = [
+    Uint8Array.from([0, 1, 2, 3]),
+    Uint8Array.from([4, 5, 6, 7]),
+  ];
+  const recoveryShards = await buildRecoveryShards(originalShards, 1);
+  const digestBytes = new Uint8Array(96);
+
+  t.mock.method(MultipartDecoder, "create", () => ({
+    readable: new ReadableStream({
+      start(controller) {
+        const enqueuePart = (name, chunks) => {
+          controller.enqueue(new Response(new ReadableStream({
+            start(bodyController) {
+              for (const chunk of chunks) {
+                bodyController.enqueue(chunk);
+              }
+              bodyController.close();
+            },
+          }), {
+            headers: {
+              "content-disposition": `form-data; name="${name}"; filename="${name}.bin"`,
+              "content-type": "application/octet-stream",
+            },
+          }));
+        };
+
+        enqueuePart("digests", [new Uint16Array(digestBytes.buffer)]);
+        enqueuePart("shard_0", [Array.from(originalShards[0])]);
+        enqueuePart(
+          "shard_2",
+          [recoveryShards[0].buffer.slice(
+            recoveryShards[0].byteOffset,
+            recoveryShards[0].byteOffset + recoveryShards[0].byteLength,
+          )],
+        );
+        controller.close();
+      },
+    }),
+    writable: new WritableStream({
+      write() {},
+      close() {},
+      abort() {},
+    }),
+  }));
+
+  const response = await worker.fetch(
+    new Request(createWorkerUrl({
+      original_count: 2,
+      recovery_count: 1,
+      shard_size: 4,
+      missing_indices: [1],
+    }), {
+      method: "POST",
+      headers: {
+        "content-type": "multipart/form-data; boundary=mocked",
+      },
+      body: new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      }),
+      duplex: "half",
+    }),
+    {},
+    {},
+  );
+  const repairedParts = await collectResponseParts(response);
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(repairedParts.map((part) => part.name), ["shard_1"]);
+  assert.deepEqual(repairedParts[0].bytes, originalShards[1]);
 });
 
 test("verifies optional per-shard digests before committing input shards", async () => {
@@ -1248,8 +1571,7 @@ test("treats non-32-byte digest results as mismatches", { concurrency: false }, 
     4711,
   );
 
-  assert.equal(response.status, 422);
-  assert.match((await response.json()).error, /digest mismatch for slot 0/);
+  await assertMultipartStreamFailure(response, /digest mismatch for slot 0/);
 });
 
 test("rejects shard parts whose digest does not match the digests part", async () => {
@@ -1273,8 +1595,7 @@ test("rejects shard parts whose digest does not match the digests part", async (
     472,
   );
 
-  assert.equal(response.status, 422);
-  assert.match((await response.json()).error, /digest mismatch for slot 0/);
+  await assertMultipartStreamFailure(response, /digest mismatch for slot 0/);
 });
 
 test("rejects out-of-range requested missing indices before shard reads", async (t) => {
@@ -1302,7 +1623,7 @@ test("rejects out-of-range requested missing indices before shard reads", async 
   }
 });
 
-test("stops pulling request chunks once the repair threshold is satisfied", async () => {
+test("returns before request ingress is fully consumed once the repair threshold is satisfied", async () => {
   const originalShards = [
     Uint8Array.from([0, 1, 2, 3]),
     Uint8Array.from([4, 5, 6, 7]),
@@ -1313,6 +1634,7 @@ test("stops pulling request chunks once the repair threshold is satisfied", asyn
   const chunkSize = 17;
   let cancellationReason = null;
   let pulledChunks = 0;
+  const pulledLabels = [];
   const parts = [
     buildPart("shard_0", originalShards[0]),
     buildPart("shard_2", recoveryShards[0]),
@@ -1327,8 +1649,9 @@ test("stops pulling request chunks once the repair threshold is satisfied", asyn
       onCancel(reason) {
         cancellationReason = reason;
       },
-      onChunk() {
+      onChunk(label) {
         pulledChunks += 1;
+        pulledLabels.push(label);
       },
     },
   );
@@ -1354,10 +1677,19 @@ test("stops pulling request chunks once the repair threshold is satisfied", asyn
   assert.equal(response.status, 200);
   const pulledChunksAtResolution = pulledChunks;
   assert.ok(pulledChunksAtResolution < totalPullableChunks);
+  assert.equal(cancellationReason, null);
+
+  const repairedParts = await collectResponseParts(response);
+  assert.deepEqual(repairedParts.map((part) => part.name), ["shard_1"]);
+
+  await wait(100);
+  const pulledChunksAfterCancellation = pulledChunks;
+
+  assert.ok(pulledChunksAfterCancellation < totalPullableChunks);
 
   await wait(100);
 
-  assert.equal(pulledChunks, pulledChunksAtResolution);
+  assert.equal(pulledChunks, pulledChunksAfterCancellation);
   if (cancellationReason !== null) {
     assert.match(String(cancellationReason), /repair threshold reached|AbortError/);
   }
@@ -1433,10 +1765,9 @@ test("waitUntil also tracks rejected background pumps", async () => {
     },
   );
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /multipart header is malformed/);
+  await assertMultipartStreamFailure(response, /multipart header is malformed/);
   assert.equal(waitUntilCalls.length, 1);
-  await waitUntilCalls[0];
+  await assert.rejects(waitUntilCalls[0], /multipart header is malformed/);
 });
 
 test("returns 405 for unsupported methods", async () => {

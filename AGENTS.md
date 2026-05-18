@@ -6,7 +6,7 @@ This repository is intentionally set up for small, validated changes.
 
 - Run `npm test` before and after behavior changes.
 - Rebuild wasm with `npm run build` when you touch Rust or wasm-facing JS.
-- Use `npm run test:coverage` for enforced JS coverage on `_worker.js`, `bin/main.js`, and `lib/mod.js`.
+- Use `npm run test:coverage` for enforced JS coverage on `_worker.js`, `bin/main.js`, `lib/mod.js`, and `lib/multipart.js`.
 
 ## Repository-specific rules
 
@@ -31,13 +31,14 @@ This repository is intentionally set up for small, validated changes.
 
 1. `cargo test --lib` for Rust-only changes
 2. `npm test` for end-to-end repo validation
-3. `npm run test:coverage` when you extend JS tests or coverage targets
+3. `npm run test:coverage` when you extend JS tests or touch `_worker.js`, `bin/main.js`, `lib/mod.js`, or `lib/multipart.js`
 
 ## High-value files
 
 - `src/lib.rs`: pointer registry, shard arena management, codec entrypoints
+- `lib/multipart.js`: generic RFC 7578 multipart decoder/encoder utilities shared by the Worker tests and request path
 - `lib/mod.js`: shared `Par3` layout validation, arena lifecycle, and repair logic
-- `_worker.js`: request parsing, threshold logic, multipart response generation
+- `_worker.js`: immediate-return Worker orchestration, multipart ingestion, threshold logic, and response stream lifetime management
 - `bin/main.js`: local CLI implementation over the shared `Par3` runtime
 - `_worker_test.js`: Worker behavior and property-style tests
 - `bin/main_test.js`: CLI behavior and validation coverage

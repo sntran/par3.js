@@ -89,6 +89,8 @@ function parseShardSpec(rawValue) {
   };
 }
 
+// The CLI works on discrete files that already exist on disk, so it uses direct filesystem IO and
+// bypasses the Worker's multipart streaming pipeline entirely.
 async function loadShardInputs(rawSpecs = [], shardSize, slotCount) {
   const shards = new Map();
 
