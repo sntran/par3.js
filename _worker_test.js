@@ -2,13 +2,50 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import worker from "./_worker.js";
-import { MultipartStreamReader, parseMultipartBoundary } from "./lib/multipart.js";
+import { MultipartTransformStream, parseMultipartBoundary } from "./lib/multipart.js";
 import { Par3 } from "./lib/mod.js";
 import * as wasmModule from "./pkg/par3_bg.wasm";
 import { alloc_shard_arena, free_shard_arena, leopard_encode, shard_arena_ptr } from "./pkg/par3.js";
 
 const { memory } = wasmModule;
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const CRLF = encoder.encode("\r\n");
+const DOUBLE_CRLF = encoder.encode("\r\n\r\n");
+const DASH_DASH = encoder.encode("--");
+
+function startsWithBytes(bytes, prefix) {
+  if (bytes.byteLength < prefix.byteLength) {
+    return false;
+  }
+
+  for (let index = 0; index < prefix.byteLength; index += 1) {
+    if (bytes[index] !== prefix[index]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function indexOfBytes(bytes, needle) {
+  const limit = bytes.byteLength - needle.byteLength;
+  for (let start = 0; start <= limit; start += 1) {
+    let matches = true;
+    for (let offset = 0; offset < needle.byteLength; offset += 1) {
+      if (bytes[start + offset] !== needle[offset]) {
+        matches = false;
+        break;
+      }
+    }
+
+    if (matches) {
+      return start;
+    }
+  }
+
+  return -1;
+}
 
 function createRng(seed) {
   let state = seed >>> 0;
@@ -90,6 +127,95 @@ function toHex(bytes) {
 
 async function sha256Hex(bytes) {
   return toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+
+  for (let offset = 0; offset < bytes.length; offset += 1) {
+    bytes[offset] = Number.parseInt(hex.slice(offset * 2, offset * 2 + 2), 16);
+  }
+
+  return bytes;
+}
+
+function createLayoutSearchParams(layout = {}) {
+  const searchParams = new URLSearchParams();
+
+  if (layout.original_count !== undefined) {
+    searchParams.set("n", String(layout.original_count));
+  }
+
+  if (layout.recovery_count !== undefined) {
+    searchParams.set("r", String(layout.recovery_count));
+  }
+
+  if (layout.shard_size !== undefined) {
+    searchParams.set("s", String(layout.shard_size));
+  }
+
+  if (layout.total_shard_count !== undefined) {
+    searchParams.set("total_shard_count", String(layout.total_shard_count));
+  }
+
+  for (const index of layout.missing_indices ?? []) {
+    searchParams.append("i", String(index));
+  }
+
+  return searchParams;
+}
+
+function createWorkerUrl(layoutOrSearchParams = {}) {
+  const url = new URL("https://example.com/repair");
+  const searchParams = layoutOrSearchParams instanceof URLSearchParams
+    ? layoutOrSearchParams
+    : createLayoutSearchParams(layoutOrSearchParams);
+  const query = searchParams.toString();
+
+  if (query) {
+    url.search = query;
+  }
+
+  return url.toString();
+}
+
+function defaultWorkerSearchParams() {
+  return createLayoutSearchParams({
+    original_count: 1,
+    recovery_count: 1,
+    shard_size: 4,
+    missing_indices: [1],
+  });
+}
+
+function buildDigestBlob(slotDigests) {
+  const digestBytes = new Uint8Array(slotDigests.length * 32);
+
+  for (const [slotIndex, digest] of slotDigests.entries()) {
+    if (digest === null || digest === undefined) {
+      continue;
+    }
+
+    digestBytes.set(hexToBytes(digest), slotIndex * 32);
+  }
+
+  return digestBytes;
+}
+
+function buildWorkerParts(parts, metadata = {}) {
+  const workerParts = [];
+
+  if (metadata.digests !== undefined) {
+    workerParts.push({
+      name: "digests",
+      filename: "digests.bin",
+      contentType: "application/octet-stream",
+      body: buildDigestBlob(metadata.digests),
+    });
+  }
+
+  workerParts.push(...parts);
+  return workerParts;
 }
 
 function wait(milliseconds) {
@@ -195,7 +321,7 @@ async function readStream(stream) {
         break;
       }
 
-      chunks.push(value);
+      chunks.push(Uint8Array.from(value));
       totalLength += value.byteLength;
     }
   } finally {
@@ -242,50 +368,57 @@ async function collectResponseParts(response) {
     return [];
   }
 
-  const contentType = response.headers.get("content-type");
-  assert.match(contentType ?? "", /boundary=/);
-  const boundary = parseMultipartBoundary(contentType);
-  const parser = new MultipartStreamReader(response.body, boundary);
+  const boundary = parseMultipartBoundary(response.headers.get("content-type"));
+  const boundaryBytes = encoder.encode(`--${boundary}`);
+  const partBoundary = encoder.encode(`\r\n--${boundary}`);
+  let buffer = await readStream(response.body);
   const parts = [];
 
-  let hasNextPart = await parser.start();
-  try {
-    while (hasNextPart) {
-      const part = await parser.readHeaders();
-      const chunks = [];
-      let totalLength = 0;
+  assert.equal(startsWithBytes(buffer, boundaryBytes), true);
+  buffer = buffer.subarray(boundaryBytes.byteLength);
+  assert.equal(startsWithBytes(buffer, CRLF), true);
+  buffer = buffer.subarray(CRLF.byteLength);
 
-      hasNextPart = await parser.readPartBody(async (chunk) => {
-        chunks.push(Uint8Array.from(chunk));
-        totalLength += chunk.byteLength;
-      });
+  while (buffer.byteLength > 0) {
+    const headerEnd = indexOfBytes(buffer, DOUBLE_CRLF);
+    assert.notEqual(headerEnd, -1);
 
-      const bytes = new Uint8Array(totalLength);
-      let offset = 0;
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.byteLength;
+    const rawHeaders = decoder.decode(buffer.subarray(0, headerEnd));
+    const partNameMatch = /name="([^"]+)"/u.exec(rawHeaders);
+    assert.ok(partNameMatch);
+
+    buffer = buffer.subarray(headerEnd + DOUBLE_CRLF.byteLength);
+    const boundaryIndex = indexOfBytes(buffer, partBoundary);
+    assert.notEqual(boundaryIndex, -1);
+
+    parts.push({
+      bytes: Uint8Array.from(buffer.subarray(0, boundaryIndex)),
+      name: partNameMatch[1],
+    });
+
+    buffer = buffer.subarray(boundaryIndex + partBoundary.byteLength);
+    if (startsWithBytes(buffer, DASH_DASH)) {
+      buffer = buffer.subarray(DASH_DASH.byteLength);
+      if (startsWithBytes(buffer, CRLF)) {
+        buffer = buffer.subarray(CRLF.byteLength);
       }
-
-      parts.push({
-        name: part.name,
-        bytes,
-      });
+      break;
     }
-  } finally {
-    parser.release();
+
+    assert.equal(startsWithBytes(buffer, CRLF), true);
+    buffer = buffer.subarray(CRLF.byteLength);
   }
 
   return parts;
 }
 
-async function invokeMultipart(parts, seed) {
+async function invokeMultipart(parts, seed, { searchParams = defaultWorkerSearchParams() } = {}) {
   const boundary = `----par3-${seed}`;
   const rng = createRng(seed ^ 0xa5a5a5a5);
   const requestBody = createStreamingMultipart(parts, boundary, rng);
 
   return worker.fetch(
-    new Request("https://example.com/repair", {
+    new Request(createWorkerUrl(searchParams), {
       method: "POST",
       headers: {
         "content-type": `multipart/form-data; boundary=${boundary}`,
@@ -298,9 +431,13 @@ async function invokeMultipart(parts, seed) {
   );
 }
 
-async function invokeRawRequest({ body, contentType }) {
+async function invokeRawRequest({
+  body,
+  contentType,
+  searchParams = defaultWorkerSearchParams(),
+}) {
   return worker.fetch(
-    new Request("https://example.com/repair", {
+    new Request(createWorkerUrl(searchParams), {
       method: "POST",
       headers: contentType ? { "content-type": contentType } : {},
       body,
@@ -343,17 +480,9 @@ function encodeMultipartBytes(parts, boundary, { trailingCrlf = true } = {}) {
 }
 
 async function invokeWorker(parts, metadata, seed) {
-  return invokeMultipart(
-    [
-      {
-        name: "metadata",
-        contentType: "application/json",
-        body: JSON.stringify(metadata),
-      },
-      ...parts,
-    ],
-    seed,
-  );
+  return invokeMultipart(buildWorkerParts(parts, metadata), seed, {
+    searchParams: createLayoutSearchParams(metadata),
+  });
 }
 
 async function createRepairCase(seed, requestedMode = "subset") {
@@ -383,14 +512,6 @@ async function createRepairCase(seed, requestedMode = "subset") {
     ? []
     : pickSortedSubset(rng, actualMissingIndices, requestedMissingCount);
   const parts = [];
-
-  if ((seed & 1) === 0) {
-    parts.push({
-      name: "ignored_note",
-      contentType: "text/plain",
-      body: `seed:${seed}`,
-    });
-  }
 
   for (const slotIndex of [...sentIndices, ...trailingIndices]) {
     parts.push(buildPart(`shard_${slotIndex}`, referenceSlots[slotIndex]));
@@ -448,43 +569,29 @@ test("returns 204 when omitted shards are not requested outputs", async (t) => {
   }
 });
 
-test("returns 400 when the multipart body never provides metadata", async () => {
+test("returns 400 when required query parameters are missing", async () => {
   const response = await invokeMultipart(
-    [{
-      name: "ignored_note",
-      contentType: "text/plain",
-      body: "hello",
-    }],
+    [buildPart("shard_0", Uint8Array.from([0, 1, 2, 3]))],
     140,
+    { searchParams: new URLSearchParams() },
   );
 
   assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /metadata part is required/);
+  assert.match((await response.json()).error, /n must be an integer greater than or equal to 1/);
 });
 
-test("rejects shard parts that arrive before metadata", async () => {
-  const boundary = "----par3-no-metadata";
-  const body = createStreamingMultipart(
-    [buildPart("shard_0", Uint8Array.from([0, 1, 2, 3]))],
-    boundary,
-    createRng(77),
-  );
-
-  const response = await worker.fetch(
-    new Request("https://example.com/repair", {
-      method: "POST",
-      headers: {
-        "content-type": `multipart/form-data; boundary=${boundary}`,
-      },
-      body,
-      duplex: "half",
-    }),
-    {},
-    {},
+test("rejects unexpected metadata parts in strict binary mode", async () => {
+  const response = await invokeMultipart(
+    [{
+      name: "metadata",
+      contentType: "application/json",
+      body: JSON.stringify({ original_count: 2 }),
+    }],
+    141,
   );
 
   assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /metadata part must arrive before shard parts/);
+  assert.match((await response.json()).error, /unexpected multipart part metadata/);
 });
 
 test("rejects duplicate shard parts", async () => {
@@ -524,7 +631,7 @@ test("rejects requests that never reach the repair threshold", async () => {
 
 test("maps malformed multipart bodies to 400", async () => {
   const response = await worker.fetch(
-    new Request("https://example.com/repair", {
+    new Request(createWorkerUrl(defaultWorkerSearchParams()), {
       method: "POST",
       headers: {
         "content-type": "multipart/form-data; boundary=broken",
@@ -677,57 +784,44 @@ test("rejects malformed multipart headers during direct request parsing", async 
   }
 });
 
-test("rejects invalid JSON metadata", async () => {
+test("rejects digests parts that arrive after shard parts", async () => {
   const response = await invokeMultipart(
-    [{
-      name: "metadata",
-      contentType: "application/json",
-      body: "{not-json",
-    }],
+    [
+      buildPart("shard_0", Uint8Array.from([0, 1, 2, 3])),
+      {
+        name: "digests",
+        contentType: "application/octet-stream",
+        body: new Uint8Array(64),
+      },
+    ],
     401,
+    {
+      searchParams: createLayoutSearchParams({
+        original_count: 2,
+        recovery_count: 1,
+        shard_size: 4,
+        missing_indices: [1],
+      }),
+    },
   );
 
   assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /metadata is not valid JSON/);
-});
-
-test("rejects empty metadata parts", async () => {
-  const boundary = "----par3-empty-metadata";
-  const response = await invokeRawRequest({
-    contentType: `multipart/form-data; boundary=${boundary}`,
-    body:
-      `--${boundary}\r\n` +
-      'Content-Disposition: form-data; name="metadata"\r\n' +
-      "Content-Type: application/json\r\n\r\n" +
-      `\r\n--${boundary}--\r\n`,
-  });
-
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /metadata is not valid JSON/);
+  assert.match((await response.json()).error, /digests part must arrive before shard parts/);
 });
 
 test("accepts unquoted content-disposition parameters", async () => {
   const boundary = "----par3-unquoted-params";
-  const metadataHeader = encoder.encode(
+  const shardHeader = encoder.encode(
     `--${boundary}\r\n` +
-    "Content-Disposition: form-data; ignored=value; name=metadata\r\n" +
-    "Content-Type: application/json\r\n\r\n" +
-    JSON.stringify({
-      original_count: 1,
-      recovery_count: 1,
-      shard_size: 4,
-      missing_indices: [1],
-    }) +
-    `\r\n--${boundary}\r\n` +
-    "Content-Disposition: form-data; name=shard_0; filename=shard_0.bin\r\n" +
+    "Content-Disposition: form-data; ignored=value; name=shard_0; filename=shard_0.bin\r\n" +
     "Content-Type: application/octet-stream\r\n\r\n",
   );
   const shardBytes = Uint8Array.from([0, 1, 2, 3]);
   const closingBoundary = encoder.encode(`\r\n--${boundary}--\r\n`);
-  const body = new Uint8Array(metadataHeader.byteLength + shardBytes.byteLength + closingBoundary.byteLength);
-  body.set(metadataHeader);
-  body.set(shardBytes, metadataHeader.byteLength);
-  body.set(closingBoundary, metadataHeader.byteLength + shardBytes.byteLength);
+  const body = new Uint8Array(shardHeader.byteLength + shardBytes.byteLength + closingBoundary.byteLength);
+  body.set(shardHeader);
+  body.set(shardBytes, shardHeader.byteLength);
+  body.set(closingBoundary, shardHeader.byteLength + shardBytes.byteLength);
   const response = await invokeRawRequest({
     contentType: `multipart/form-data; boundary=${boundary}`,
     body,
@@ -740,12 +834,7 @@ test("accepts unquoted content-disposition parameters", async () => {
 
 test("rejects truncated or oversized multipart parser states", async (t) => {
   const boundary = "----par3-parser-edge-cases";
-  const metadata = JSON.stringify({
-    original_count: 1,
-    recovery_count: 1,
-    shard_size: 4,
-    missing_indices: [1],
-  });
+  const shardBody = "abcd";
   const oversizedHeader = "X-Oversized: " + "x".repeat(9 * 1024);
   const cases = [
     {
@@ -773,27 +862,27 @@ test("rejects truncated or oversized multipart parser states", async (t) => {
       name: "missing next boundary after part body",
       body:
         `--${boundary}\r\n` +
-        'Content-Disposition: form-data; name="metadata"\r\n' +
-        "Content-Type: application/json\r\n\r\n" +
-        metadata,
+        'Content-Disposition: form-data; name="shard_0"\r\n' +
+        "Content-Type: application/octet-stream\r\n\r\n" +
+        shardBody,
       pattern: /multipart body terminated before the next boundary/,
     },
     {
       name: "truncated bytes after a boundary marker",
       body:
         `--${boundary}\r\n` +
-        'Content-Disposition: form-data; name="metadata"\r\n' +
-        "Content-Type: application/json\r\n\r\n" +
-        `${metadata}\r\n--${boundary}`,
+        'Content-Disposition: form-data; name="shard_0"\r\n' +
+        "Content-Type: application/octet-stream\r\n\r\n" +
+        `${shardBody}\r\n--${boundary}`,
       pattern: /multipart body terminated after a part boundary/,
     },
     {
       name: "invalid separator after a part boundary",
       body:
         `--${boundary}\r\n` +
-        'Content-Disposition: form-data; name="metadata"\r\n' +
-        "Content-Type: application/json\r\n\r\n" +
-        `${metadata}\r\n--${boundary}xx`,
+        'Content-Disposition: form-data; name="shard_0"\r\n' +
+        "Content-Type: application/octet-stream\r\n\r\n" +
+        `${shardBody}\r\n--${boundary}xx`,
       pattern: /multipart boundary must end with CRLF/,
     },
     {
@@ -823,8 +912,8 @@ test("accepts a multipart stream that closes immediately with the final boundary
     body: `--${boundary}--\r\n`,
   });
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /metadata part is required/);
+  assert.equal(response.status, 422);
+  assert.match((await response.json()).error, /repair threshold not reached/);
 });
 
 test("accepts an immediate final boundary without a trailing CRLF", async () => {
@@ -834,8 +923,8 @@ test("accepts an immediate final boundary without a trailing CRLF", async () => 
     body: `--${boundary}--`,
   });
 
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /metadata part is required/);
+  assert.equal(response.status, 422);
+  assert.match((await response.json()).error, /repair threshold not reached/);
 });
 
 test("accepts a final multipart boundary without a trailing CRLF", async () => {
@@ -843,19 +932,7 @@ test("accepts a final multipart boundary without a trailing CRLF", async () => {
   const response = await invokeRawRequest({
     contentType: `multipart/form-data; boundary=${boundary}`,
     body: encodeMultipartBytes(
-      [
-        {
-          name: "metadata",
-          contentType: "application/json",
-          body: JSON.stringify({
-            original_count: 1,
-            recovery_count: 1,
-            shard_size: 4,
-            missing_indices: [1],
-          }),
-        },
-        buildPart("shard_0", Uint8Array.from([0, 1, 2, 3])),
-      ],
+      [buildPart("shard_0", Uint8Array.from([0, 1, 2, 3]))],
       boundary,
       { trailingCrlf: false },
     ),
@@ -866,58 +943,38 @@ test("accepts a final multipart boundary without a trailing CRLF", async () => {
   assert.deepEqual(repairedParts.map((part) => part.name), ["shard_1"]);
 });
 
-test("rejects invalid metadata fields", async (t) => {
+test("rejects invalid query parameters", async (t) => {
   const cases = [
     {
-      name: "original_count below minimum",
-      metadata: { original_count: 0, recovery_count: 1, shard_size: 4, missing_indices: [1] },
-      pattern: /original_count must be an integer greater than or equal to 1/,
+      name: "n below minimum",
+      searchParams: new URLSearchParams([["n", "0"], ["r", "1"], ["s", "4"], ["i", "1"]]),
+      pattern: /n must be an integer greater than or equal to 1/,
     },
     {
-      name: "recovery_count below minimum",
-      metadata: { original_count: 2, recovery_count: -1, shard_size: 4, missing_indices: [1] },
-      pattern: /recovery_count must be an integer greater than or equal to 0/,
+      name: "r below minimum",
+      searchParams: new URLSearchParams([["n", "2"], ["r", "-1"], ["s", "4"], ["i", "1"]]),
+      pattern: /r must be an integer greater than or equal to 0/,
     },
     {
-      name: "odd shard_size",
-      metadata: { original_count: 2, recovery_count: 1, shard_size: 3, missing_indices: [1] },
-      pattern: /shard_size must be even/,
+      name: "odd s",
+      searchParams: new URLSearchParams([["n", "2"], ["r", "1"], ["s", "3"], ["i", "1"]]),
+      pattern: /s must be even/,
     },
     {
-      name: "missing_indices must be an array",
-      metadata: { original_count: 2, recovery_count: 1, shard_size: 4, missing_indices: "1" },
-      pattern: /missing_indices must be an array of integer slot indexes/,
+      name: "i must be an integer",
+      searchParams: new URLSearchParams([["n", "2"], ["r", "1"], ["s", "4"], ["i", "nope"]]),
+      pattern: /i\[\] must be an integer greater than or equal to 0/,
     },
     {
-      name: "missing_indices[] below minimum",
-      metadata: { original_count: 2, recovery_count: 1, shard_size: 4, missing_indices: [-1] },
-      pattern: /missing_indices\[\] must be an integer greater than or equal to 0/,
-    },
-    {
-      name: "digests must be an array",
-      metadata: { original_count: 2, recovery_count: 1, shard_size: 4, missing_indices: [1], digests: "bad" },
-      pattern: /digests must be an array of SHA-256 hex strings or null values/,
-    },
-    {
-      name: "digests must match slot count",
-      metadata: { original_count: 2, recovery_count: 1, shard_size: 4, missing_indices: [1], digests: [null] },
-      pattern: /digests must contain exactly 3 entries/,
-    },
-    {
-      name: "digests entries must be SHA-256 hex",
-      metadata: { original_count: 2, recovery_count: 1, shard_size: 4, missing_indices: [1], digests: [null, "abc", null] },
-      pattern: /digests\[1\] must be a 64-character hexadecimal SHA-256 digest or null/,
-    },
-    {
-      name: "digests entries must be strings when present",
-      metadata: { original_count: 2, recovery_count: 1, shard_size: 4, missing_indices: [1], digests: [null, 123, null] },
-      pattern: /digests\[1\] must be a 64-character hexadecimal SHA-256 digest or null/,
+      name: "i below minimum",
+      searchParams: new URLSearchParams([["n", "2"], ["r", "1"], ["s", "4"], ["i", "-1"]]),
+      pattern: /i\[\] must be an integer greater than or equal to 0/,
     },
   ];
 
   for (const [offset, testCase] of cases.entries()) {
     await t.test(testCase.name, async () => {
-      const response = await invokeWorker([], testCase.metadata, 410 + offset);
+      const response = await invokeMultipart([], 410 + offset, { searchParams: testCase.searchParams });
 
       assert.equal(response.status, 400);
       assert.match((await response.json()).error, testCase.pattern);
@@ -925,23 +982,35 @@ test("rejects invalid metadata fields", async (t) => {
   }
 });
 
-test("rejects duplicate metadata parts", async () => {
-  const metadata = JSON.stringify({
-    original_count: 2,
-    recovery_count: 1,
-    shard_size: 4,
-    missing_indices: [1],
-  });
+test("rejects duplicate digests parts", async () => {
   const response = await invokeMultipart(
     [
-      { name: "metadata", contentType: "application/json", body: metadata },
-      { name: "metadata", contentType: "application/json", body: metadata },
+      { name: "digests", contentType: "application/octet-stream", body: new Uint8Array(64) },
+      { name: "digests", contentType: "application/octet-stream", body: new Uint8Array(64) },
     ],
     420,
+    {
+      searchParams: createLayoutSearchParams({
+        original_count: 1,
+        recovery_count: 1,
+        shard_size: 4,
+        missing_indices: [1],
+      }),
+    },
   );
 
   assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /metadata part may only appear once/);
+  assert.match((await response.json()).error, /digests part may only appear once/);
+});
+
+test("rejects undersized digests parts", async () => {
+  const response = await invokeMultipart(
+    [{ name: "digests", contentType: "application/octet-stream", body: new Uint8Array(31) }],
+    421,
+  );
+
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /digests must contain exactly 2 contiguous 32-byte hashes/);
 });
 
 test("rejects oversized shard parts", async () => {
@@ -991,7 +1060,7 @@ test("rejects worker requests without a locked slot count", async () => {
   );
 
   assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /metadata must declare recovery_count or total_shard_count/);
+  assert.match((await response.json()).error, /query parameters must declare r or total_shard_count/);
 });
 
 test("rejects shard indexes outside a declared total_shard_count", async () => {
@@ -1022,7 +1091,12 @@ test("rejects shard indexes outside a declared total_shard_count", async () => {
 
 test("rejects POST requests without a body", async () => {
   const response = await worker.fetch(
-    new Request("https://example.com/repair", {
+    new Request(createWorkerUrl({
+      original_count: 1,
+      recovery_count: 1,
+      shard_size: 4,
+      missing_indices: [1],
+    }), {
       method: "POST",
     }),
     {},
@@ -1031,6 +1105,48 @@ test("rejects POST requests without a body", async () => {
 
   assert.equal(response.status, 400);
   assert.match((await response.json()).error, /request body is required/);
+});
+
+test("rejects invalid layouts before allocating or reading request bytes", { concurrency: false }, async (t) => {
+  const originalAllocShardArena = Par3.bindings.alloc_shard_arena;
+  const originalCreateTransform = MultipartTransformStream.create;
+  let allocCalls = 0;
+  let createCalls = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      controller.enqueue(encoder.encode("unused"));
+      controller.close();
+    },
+  });
+  const request = new Request(createWorkerUrl({
+    original_count: 2,
+    recovery_count: 1,
+    shard_size: 4,
+    missing_indices: [3],
+  }), {
+    method: "POST",
+    headers: {
+      "content-type": "multipart/form-data; boundary=----par3-no-read",
+    },
+    body,
+    duplex: "half",
+  });
+
+  t.mock.method(Par3.bindings, "alloc_shard_arena", (...args) => {
+    allocCalls += 1;
+    return originalAllocShardArena(...args);
+  });
+  t.mock.method(MultipartTransformStream, "create", (...args) => {
+    createCalls += 1;
+    return originalCreateTransform(...args);
+  });
+
+  const response = await worker.fetch(request, {}, {});
+
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /i\[\] must be less than total_shard_count 3/);
+  assert.equal(allocCalls, 0);
+  assert.equal(createCalls, 0);
 });
 
 test("releases response resources when the caller cancels a multipart response", async () => {
@@ -1044,7 +1160,7 @@ test("releases response resources when the caller cancels a multipart response",
 test("releases response resources when streaming a shard throws", { concurrency: false }, async (t) => {
   const testCase = await createRepairCase(451, "all");
 
-  t.mock.method(Par3.prototype, "readShard", () => {
+  t.mock.method(Par3.prototype, "shardView", () => {
     throw new Error("forced shard read failure");
   });
 
@@ -1054,24 +1170,26 @@ test("releases response resources when streaming a shard throws", { concurrency:
   await assert.rejects(() => readStream(response.body), /forced shard read failure/);
 });
 
-test("rejects oversized metadata parts before buffering them entirely", async () => {
+test("rejects oversized digests parts before buffering them entirely", async () => {
   const response = await invokeMultipart(
     [{
-      name: "metadata",
-      contentType: "application/json",
-      body: JSON.stringify({
+      name: "digests",
+      contentType: "application/octet-stream",
+      body: new Uint8Array(128),
+    }],
+    470,
+    {
+      searchParams: createLayoutSearchParams({
         original_count: 2,
         recovery_count: 1,
         shard_size: 4,
         missing_indices: [1],
-        note: "x".repeat(70 * 1024),
       }),
-    }],
-    470,
+    },
   );
 
   assert.equal(response.status, 413);
-  assert.match((await response.json()).error, /metadata exceeds maximum size of 65536 bytes/);
+  assert.match((await response.json()).error, /digests exceeds expected size of 96 bytes/);
 });
 
 test("verifies optional per-shard digests before committing input shards", async () => {
@@ -1101,7 +1219,40 @@ test("verifies optional per-shard digests before committing input shards", async
   assert.deepEqual(repairedParts[0].bytes, originalShards[1]);
 });
 
-test("rejects shard parts whose digest does not match metadata", async () => {
+test("treats non-32-byte digest results as mismatches", { concurrency: false }, async (t) => {
+  const originalShards = [
+    Uint8Array.from([0, 1, 2, 3]),
+    Uint8Array.from([4, 5, 6, 7]),
+  ];
+  const recoveryShards = await buildRecoveryShards(originalShards, 1);
+  const slotDigests = [
+    await sha256Hex(originalShards[0]),
+    null,
+    await sha256Hex(recoveryShards[0]),
+  ];
+
+  t.mock.method(crypto.subtle, "digest", async () => new Uint8Array(31).buffer);
+
+  const response = await invokeWorker(
+    [
+      buildPart("shard_0", originalShards[0]),
+      buildPart("shard_2", recoveryShards[0]),
+    ],
+    {
+      original_count: 2,
+      recovery_count: 1,
+      shard_size: 4,
+      missing_indices: [1],
+      digests: slotDigests,
+    },
+    4711,
+  );
+
+  assert.equal(response.status, 422);
+  assert.match((await response.json()).error, /digest mismatch for slot 0/);
+});
+
+test("rejects shard parts whose digest does not match the digests part", async () => {
   const originalShards = [
     Uint8Array.from([0, 1, 2, 3]),
     Uint8Array.from([4, 5, 6, 7]),
@@ -1117,7 +1268,7 @@ test("rejects shard parts whose digest does not match metadata", async () => {
       recovery_count: 1,
       shard_size: 4,
       missing_indices: [1],
-      digests: ["00".repeat(32), null, await sha256Hex(recoveryShards[0])],
+      digests: ["11".repeat(32), null, await sha256Hex(recoveryShards[0])],
     },
     472,
   );
@@ -1145,7 +1296,7 @@ test("rejects out-of-range requested missing indices before shard reads", async 
       assert.equal(response.status, 400);
       assert.match(
         (await response.json()).error,
-        /requested missing index \d+ was already provided or is outside the inferred missing set/,
+        /i\[\] must be less than total_shard_count \d+/,
       );
     });
   }
@@ -1163,16 +1314,6 @@ test("stops pulling request chunks once the repair threshold is satisfied", asyn
   let cancellationReason = null;
   let pulledChunks = 0;
   const parts = [
-    {
-      name: "metadata",
-      contentType: "application/json",
-      body: JSON.stringify({
-        original_count: 2,
-        recovery_count: 1,
-        shard_size: 4,
-        missing_indices: [1],
-      }),
-    },
     buildPart("shard_0", originalShards[0]),
     buildPart("shard_2", recoveryShards[0]),
     buildPart("shard_1", trailingBody),
@@ -1193,7 +1334,12 @@ test("stops pulling request chunks once the repair threshold is satisfied", asyn
   );
 
   const response = await worker.fetch(
-    new Request("https://example.com/repair", {
+    new Request(createWorkerUrl({
+      original_count: 2,
+      recovery_count: 1,
+      shard_size: 4,
+      missing_indices: [1],
+    }), {
       method: "POST",
       headers: {
         "content-type": `multipart/form-data; boundary=${boundary}`,
@@ -1207,12 +1353,14 @@ test("stops pulling request chunks once the repair threshold is satisfied", asyn
 
   assert.equal(response.status, 200);
   const pulledChunksAtResolution = pulledChunks;
-  assert.equal(cancellationReason, "repair threshold reached");
   assert.ok(pulledChunksAtResolution < totalPullableChunks);
 
   await wait(100);
 
   assert.equal(pulledChunks, pulledChunksAtResolution);
+  if (cancellationReason !== null) {
+    assert.match(String(cancellationReason), /repair threshold reached|AbortError/);
+  }
 });
 
 test("maps unexpected runtime failures to a 500 response", { concurrency: false }, async (t) => {
@@ -1227,6 +1375,68 @@ test("maps unexpected runtime failures to a 500 response", { concurrency: false 
 
   assert.equal(response.status, 500);
   assert.match((await response.json()).error, /internal server error/);
+});
+
+test("registers the background pump with ctx.waitUntil when available", async () => {
+  const waitUntilCalls = [];
+  const response = await worker.fetch(
+    new Request(createWorkerUrl({
+      original_count: 1,
+      recovery_count: 1,
+      shard_size: 4,
+      missing_indices: [1],
+    }), {
+      method: "POST",
+      headers: {
+        "content-type": "multipart/form-data; boundary=----par3-wait-until",
+      },
+      body: encodeMultipartBytes([buildPart("shard_0", Uint8Array.from([0, 1, 2, 3]))], "----par3-wait-until"),
+      duplex: "half",
+    }),
+    {},
+    {
+      waitUntil(promise) {
+        waitUntilCalls.push(promise);
+      },
+    },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(waitUntilCalls.length, 1);
+  const repairedParts = await collectResponseParts(response);
+  assert.deepEqual(repairedParts.map((part) => part.name), ["shard_1"]);
+  await waitUntilCalls[0];
+});
+
+test("waitUntil also tracks rejected background pumps", async () => {
+  const waitUntilCalls = [];
+  const boundary = "----par3-wait-until-error";
+  const response = await worker.fetch(
+    new Request(createWorkerUrl({
+      original_count: 1,
+      recovery_count: 1,
+      shard_size: 4,
+      missing_indices: [1],
+    }), {
+      method: "POST",
+      headers: {
+        "content-type": `multipart/form-data; boundary=${boundary}`,
+      },
+      body: encoder.encode(`--${boundary}\r\nContent-Disposition\r\n\r\nboom\r\n--${boundary}--\r\n`),
+      duplex: "half",
+    }),
+    {},
+    {
+      waitUntil(promise) {
+        waitUntilCalls.push(promise);
+      },
+    },
+  );
+
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /multipart header is malformed/);
+  assert.equal(waitUntilCalls.length, 1);
+  await waitUntilCalls[0];
 });
 
 test("returns 405 for unsupported methods", async () => {

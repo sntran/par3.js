@@ -119,6 +119,114 @@ test("CLI repairs every inferred missing shard into the output directory", async
   });
 });
 
+test("CLI create writes recovery shards from the original shard set", async () => {
+  await withTempDir(async (tempRoot) => {
+    const originalCount = 3;
+    const recoveryCount = 2;
+    const shardSize = 64;
+    const originalShards = buildOriginalShards(originalCount, shardSize);
+    const expectedRecoveryShards = await buildRecoveryShards(originalShards, recoveryCount);
+    const outputDir = join(tempRoot, "created");
+    const stdout = createWritableCapture();
+    const stderr = createWritableCapture();
+
+    for (const [index, shard] of originalShards.entries()) {
+      await writeFile(join(tempRoot, `shard_${index}.bin`), shard);
+    }
+
+    const exitCode = await runCli({
+      argv: [
+        "create",
+        "-n", String(originalCount),
+        "-r", String(recoveryCount),
+        "-s", String(shardSize),
+        "--shard", `0=${join(tempRoot, "shard_0.bin")}`,
+        "--shard", `1=${join(tempRoot, "shard_1.bin")}`,
+        "--shard", `2=${join(tempRoot, "shard_2.bin")}`,
+        "--output-dir", outputDir,
+      ],
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.read(), "");
+    assert.match(stdout.read(), /Created 2 recovery shard\(s\)\./);
+    assert.deepEqual(new Uint8Array(await readFile(join(outputDir, "shard_3.bin"))), expectedRecoveryShards[0]);
+    assert.deepEqual(new Uint8Array(await readFile(join(outputDir, "shard_4.bin"))), expectedRecoveryShards[1]);
+  });
+});
+
+test("CLI create rejects recovery-slot shard inputs", async () => {
+  await withTempDir(async (tempRoot) => {
+    const stderr = createWritableCapture();
+
+    await writeFile(join(tempRoot, "shard_0.bin"), Uint8Array.from([0, 1, 2, 3]));
+    await writeFile(join(tempRoot, "shard_1.bin"), Uint8Array.from([4, 5, 6, 7]));
+
+    const exitCode = await runCli({
+      argv: [
+        "create",
+        "-n", "1",
+        "-r", "1",
+        "-s", "4",
+        "--shard", `0=${join(tempRoot, "shard_0.bin")}`,
+        "--shard", `1=${join(tempRoot, "shard_1.bin")}`,
+        "--output-dir", join(tempRoot, "out"),
+      ],
+      stdout: createWritableCapture().stream,
+      stderr: stderr.stream,
+    });
+
+    assert.equal(exitCode, 1);
+    assert.match(stderr.read(), /create only accepts --shard inputs for original indexes below original_count 1/);
+  });
+});
+
+test("CLI create requires every original shard input", async () => {
+  await withTempDir(async (tempRoot) => {
+    const stderr = createWritableCapture();
+
+    await writeFile(join(tempRoot, "shard_0.bin"), Uint8Array.from([0, 1, 2, 3]));
+
+    const exitCode = await runCli({
+      argv: [
+        "create",
+        "-n", "2",
+        "-r", "1",
+        "-s", "4",
+        "--shard", `0=${join(tempRoot, "shard_0.bin")}`,
+        "--output-dir", join(tempRoot, "out"),
+      ],
+      stdout: createWritableCapture().stream,
+      stderr: stderr.stream,
+    });
+
+    assert.equal(exitCode, 1);
+    assert.match(stderr.read(), /missing --shard input for original slot 1/);
+  });
+});
+
+test("CLI create rejects --missing-index", async () => {
+  const stderr = createWritableCapture();
+
+  const exitCode = await runCli({
+    argv: [
+      "create",
+      "-n", "1",
+      "-r", "1",
+      "-s", "4",
+      "--missing-index", "1",
+      "--output-dir", join(tmpdir(), "par3-create-invalid"),
+    ],
+    stdout: createWritableCapture().stream,
+    stderr: stderr.stream,
+  });
+
+  assert.equal(exitCode, 1);
+  assert.match(stderr.read(), /--missing-index is only supported for repair/);
+});
+
 test("CLI can limit which repaired shards are written to disk", async () => {
   await withTempDir(async (tempRoot) => {
     const originalCount = 4;
@@ -217,6 +325,27 @@ test("CLI rejects requested outputs that were already provided", async () => {
 
     assert.equal(exitCode, 1);
     assert.match(stderr.read(), /requested missing index 0 was already provided/);
+  });
+});
+
+test("CLI repair rejects empty shard input sets with a stable error", async () => {
+  await withTempDir(async (tempRoot) => {
+    const stderr = createWritableCapture();
+
+    const exitCode = await runCli({
+      argv: [
+        "repair",
+        "--original-count", "2",
+        "--recovery-count", "1",
+        "--shard-size", "4",
+        "--output-dir", join(tempRoot, "out"),
+      ],
+      stdout: createWritableCapture().stream,
+      stderr: stderr.stream,
+    });
+
+    assert.equal(exitCode, 1);
+    assert.match(stderr.read(), /Insufficient shards provided for repair/);
   });
 });
 
@@ -525,9 +654,9 @@ test("CLI accepts the par3-style repair alias r", async () => {
     const exitCode = await runCli({
       argv: [
         "r",
-        "--original-count", String(originalCount),
-        "--recovery-count", String(recoveryCount),
-        "--shard-size", String(shardSize),
+        "-n", String(originalCount),
+        "-r", String(recoveryCount),
+        "-s", String(shardSize),
         "--shard", `0=${join(tempRoot, "shard_0.bin")}`,
         "--shard", `2=${join(tempRoot, "shard_2.bin")}`,
         "--shard", `3=${join(tempRoot, "shard_3.bin")}`,
@@ -540,6 +669,22 @@ test("CLI accepts the par3-style repair alias r", async () => {
     assert.equal(exitCode, 0);
     assert.deepEqual(new Uint8Array(await readFile(join(outputDir, "shard_1.bin"))), referenceSlots[1]);
   });
+});
+
+test("CLI help includes the interoperability example", async () => {
+  const stdout = createWritableCapture();
+  const stderr = createWritableCapture();
+
+  const exitCode = await runCli({
+    argv: ["--help"],
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(stderr.read(), "");
+  assert.match(stdout.read(), /split -b/);
+  assert.match(stdout.read(), /cat .*shard_/i);
 });
 
 test("CLI prints usage for --help", async () => {

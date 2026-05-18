@@ -4,3 +4,5 @@ target/
 .wrangler/
 .dev.vars*
 .env*
+.coverage*
+coverage_output.txt

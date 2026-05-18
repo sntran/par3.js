@@ -22,16 +22,29 @@ function usage() {
     "Usage:",
     `  ${packageMetadata.name} -h`,
     `  ${packageMetadata.name} -V`,
-    `  ${packageMetadata.name} r(epair) --original-count <count> --recovery-count <count> --shard-size <bytes> \\`,
+    `  ${packageMetadata.name} c(reate) -n <count> -r <count> -s <bytes> \\`,
+    "    --shard <index=path> [--shard <index=path> ...] --output-dir <dir>",
+    `  ${packageMetadata.name} r(epair) -n <count> -r <count> -s <bytes> \\`,
     "    --shard <index=path> [--shard <index=path> ...] --output-dir <dir> [--missing-index <index> ...]",
     "",
     "Examples:",
-    `  ${packageMetadata.name} repair --original-count 4 --recovery-count 2 --shard-size 65536 \\`,
+    `  ${packageMetadata.name} create -n 4 -r 2 -s 65536 \\`,
+    "    --shard 0=./shards/shard_0.bin --shard 1=./shards/shard_1.bin \\",
+    "    --shard 2=./shards/shard_2.bin --shard 3=./shards/shard_3.bin \\",
+    "    --output-dir ./created",
+    "",
+    `  ${packageMetadata.name} repair -n 4 -r 2 -s 65536 \\`,
     "    --shard 0=./shards/shard_0.bin --shard 2=./shards/shard_2.bin \\",
     "    --shard 3=./shards/shard_3.bin --shard 4=./shards/shard_4.bin \\",
     "    --output-dir ./repaired --missing-index 1",
     "",
+    "Interoperability example:",
+    "  split -b 65536 --numeric-suffixes=0 --suffix-length=3 ./file.bin ./raw/shard_",
+    "  cat ./raw/shard_000 > ./shards/shard_0.bin",
+    "  cat ./raw/shard_001 > ./shards/shard_1.bin",
+    "",
     "Notes:",
+    "  - Create expects every original shard index `0..n-1` to be present in --shard inputs.",
     "  - The CLI repairs every shard that is absent from --shard inputs so the codec sees the full missing set.",
     "  - --missing-index limits which repaired shards are written back to disk.",
   ].join("\n");
@@ -102,15 +115,21 @@ async function loadShardInputs(rawSpecs = [], shardSize, slotCount) {
   return shards;
 }
 
-export async function repairShardSet({
-  originalCount,
-  recoveryCount,
-  shardSize,
-  shardSpecs = [],
-  requestedMissingIndices = [],
-  outputDir,
-}) {
-  const layout = Par3.resolveLayout({
+async function writeOutputShards(codec, outputIndices, outputDir) {
+  await mkdir(outputDir, { recursive: true });
+  const outputFiles = [];
+
+  for (const index of outputIndices) {
+    const filePath = join(outputDir, `shard_${index}.bin`);
+    await writeFile(filePath, Buffer.from(codec.readShard(index)));
+    outputFiles.push({ index, filePath });
+  }
+
+  return outputFiles;
+}
+
+function resolveCliLayout({ originalCount, recoveryCount, requestedMissingIndices = [], shardSize }) {
+  return Par3.resolveLayout({
     originalCount,
     recoveryCount,
     requestedMissingIndices,
@@ -122,6 +141,57 @@ export async function repairShardSet({
       shardSize: "--shard-size",
     },
   });
+}
+
+export async function createShardSet({
+  originalCount,
+  recoveryCount,
+  shardSize,
+  shardSpecs = [],
+  outputDir,
+}) {
+  const layout = resolveCliLayout({ originalCount, recoveryCount, shardSize });
+  const shards = await loadShardInputs(shardSpecs, layout.shardSize, layout.slotCount);
+  const codec = new Par3(layout);
+
+  try {
+    for (const index of shards.keys()) {
+      if (index >= layout.originalCount) {
+        throw new Error(
+          `create only accepts --shard inputs for original indexes below original_count ${layout.originalCount}`,
+        );
+      }
+    }
+
+    for (let index = 0; index < layout.originalCount; index += 1) {
+      const bytes = shards.get(index);
+      if (!bytes) {
+        throw new Error(`missing --shard input for original slot ${index}`);
+      }
+
+      codec.writeShard(index, bytes, {
+        duplicateMessage: `duplicate --shard input for slot ${index}`,
+        overflowMessage: `shard index ${index} is outside slot_count ${layout.slotCount}`,
+        sizeMessage: `shard file for slot ${index} is ${bytes.byteLength} bytes but shard_size is ${layout.shardSize}`,
+      });
+    }
+
+    const outputFiles = await writeOutputShards(codec, codec.encode(), outputDir);
+    return { outputFiles };
+  } finally {
+    codec.free();
+  }
+}
+
+export async function repairShardSet({
+  originalCount,
+  recoveryCount,
+  shardSize,
+  shardSpecs = [],
+  requestedMissingIndices = [],
+  outputDir,
+}) {
+  const layout = resolveCliLayout({ originalCount, recoveryCount, requestedMissingIndices, shardSize });
   const shards = await loadShardInputs(shardSpecs, layout.shardSize, layout.slotCount);
   const codec = new Par3(layout);
 
@@ -146,14 +216,7 @@ export async function repairShardSet({
     }
 
     codec.repair();
-    await mkdir(outputDir, { recursive: true });
-    const outputFiles = [];
-
-    for (const index of outputIndices) {
-      const filePath = join(outputDir, `shard_${index}.bin`);
-      await writeFile(filePath, Buffer.from(codec.readShard(index)));
-      outputFiles.push({ index, filePath });
-    }
+    const outputFiles = await writeOutputShards(codec, outputIndices, outputDir);
 
     return {
       repairedIndices: inferredMissingIndices,
@@ -182,24 +245,26 @@ export async function runCli({
       options: {
         help: { type: "boolean", short: "h" },
         "missing-index": { type: "string", multiple: true },
-        "original-count": { type: "string" },
+        "original-count": { type: "string", short: "n" },
         "output-dir": { type: "string" },
-        "recovery-count": { type: "string" },
+        "recovery-count": { type: "string", short: "r" },
         shard: { type: "string", multiple: true },
-        "shard-size": { type: "string" },
+        "shard-size": { type: "string", short: "s" },
         version: { type: "boolean", short: "V" },
       },
     });
 
     const command = positionals[0];
+    const isCreateCommand = command === "create" || command === "c";
     const isRepairCommand = command === "repair" || command === "r";
+    const isKnownCommand = isCreateCommand || isRepairCommand;
     if (values.version) {
       writeLine(stdout, `${packageMetadata.name} ${packageMetadata.version}`);
       return 0;
     }
 
-    if (values.help || !isRepairCommand || positionals.length > 1) {
-      const showError = Boolean(command) && !isRepairCommand && !values.help;
+    if (values.help || !isKnownCommand || positionals.length > 1) {
+      const showError = Boolean(command) && !isKnownCommand && !values.help;
       writeLine(showError ? stderr : stdout, usage());
       return showError ? 1 : 0;
     }
@@ -215,6 +280,27 @@ export async function runCli({
       throw new Error("--output-dir is required");
     }
     const outputDir = resolve(values["output-dir"]);
+
+    if (isCreateCommand) {
+      if ((values["missing-index"] ?? []).length > 0) {
+        throw new Error("--missing-index is only supported for repair");
+      }
+
+      const result = await createShardSet({
+        originalCount,
+        recoveryCount,
+        shardSize,
+        shardSpecs: values.shard,
+        outputDir,
+      });
+
+      writeLine(stdout, `Created ${result.outputFiles.length} recovery shard(s).`);
+      for (const file of result.outputFiles) {
+        writeLine(stdout, `wrote shard_${file.index} -> ${file.filePath}`);
+      }
+
+      return 0;
+    }
 
     const result = await repairShardSet({
       originalCount,
