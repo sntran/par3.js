@@ -18,13 +18,10 @@
     "deploy": "npm run build:wasm && wrangler deploy",
     "repair": "node ./bin/main.js repair",
     "test:rust": "cargo test --lib",
-    "test:js": "npm run build:wasm && node --experimental-wasm-modules --test _worker_test.js bin/main_test.js lib/mod_test.js",
+    "test:js": "npm run build:wasm && node --experimental-wasm-modules --test _worker_test.js bin/main_test.js lib/mod_test.js lib/multipart_test.js",
     "test": "npm run test:rust && npm run test:js",
-    "test:watch": "npm run build:wasm && node --experimental-wasm-modules --test --watch _worker_test.js bin/main_test.js lib/mod_test.js",
+    "test:watch": "npm run build:wasm && node --experimental-wasm-modules --test --watch _worker_test.js bin/main_test.js lib/mod_test.js lib/multipart_test.js",
     "test:coverage": "npm run build:wasm && node ./scripts/test-coverage.mjs"
-  },
-  "dependencies": {
-    "@mjackson/multipart-parser": "^0.6.2"
   },
   "devDependencies": {
     "wrangler": "^4.16.0"

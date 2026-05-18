@@ -4,13 +4,13 @@
 //! 1. managing typed buffers inside linear memory so JavaScript can stream bytes in place,
 //! 2. delegating encoding and repair work to `reed-solomon-simd` without copying more than necessary.
 //!
-//! The exported API deliberately works in terms of registered raw pointers rather than rich Rust
-//! types because the Cloudflare Worker and the local CLI both need to fill shard arenas directly
-//! from Web Streams or filesystem reads. Tests exercise the exact same pointer-based entrypoints so
-//! that the native suite stays close to production behavior.
+//! The exported API deliberately works in terms of generation-tagged allocation handles plus
+//! explicit pointer lookups because the Cloudflare Worker and the local CLI both need to fill shard
+//! arenas directly from Web Streams or filesystem reads. Tests exercise the exact same low-level
+//! entrypoints so that the native suite stays close to production behavior.
 
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::sync::{Mutex, OnceLock};
 use wasm_bindgen::prelude::*;
@@ -25,6 +25,44 @@ struct ShardArenaMeta {
 #[derive(Debug, Clone, Copy)]
 struct U32BufferMeta {
     len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AllocationHandle(u64);
+
+impl AllocationHandle {
+    fn new(slot_id: u32, generation: u32) -> Self {
+        Self((u64::from(generation) << 32) | u64::from(slot_id))
+    }
+
+    fn null() -> Self {
+        Self(0)
+    }
+
+    fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    fn into_raw(self) -> u64 {
+        self.0
+    }
+
+    fn is_null(self) -> bool {
+        self.0 == 0
+    }
+
+    fn slot_index(self) -> Option<usize> {
+        let slot_id = self.0 as u32;
+        if slot_id == 0 {
+            None
+        } else {
+            Some((slot_id - 1) as usize)
+        }
+    }
+
+    fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,9 +81,9 @@ pub enum RepairError {
     AllocationTooLarge { slot_count: usize, shard_size: usize },
     ZeroOriginalCount,
     InvalidShardSize { shard_size: usize },
-    NullPointer { target: &'static str },
-    UnknownPointer { target: &'static str, ptr: usize },
-    AllocationTypeMismatch { target: &'static str, ptr: usize },
+    NullHandle { target: &'static str },
+    UnknownHandle { target: &'static str, handle: u64 },
+    AllocationTypeMismatch { target: &'static str, handle: u64 },
     ArenaShardSizeMismatch { expected: usize, got: usize },
     InvalidSlotLayout { original_count: usize, slot_count: usize },
     UnsupportedShardCount { original_count: usize, recovery_count: usize },
@@ -74,14 +112,14 @@ impl Display for RepairError {
                 "shard_size must be non-zero and even, got {}",
                 shard_size
             ),
-            Self::NullPointer { target } => write!(f, "null pointer for {}", target),
-            Self::UnknownPointer { target, ptr } => {
-                write!(f, "unknown {} pointer: {}", target, ptr)
+            Self::NullHandle { target } => write!(f, "null handle for {}", target),
+            Self::UnknownHandle { target, handle } => {
+                write!(f, "unknown {} handle: {}", target, handle)
             }
-            Self::AllocationTypeMismatch { target, ptr } => write!(
+            Self::AllocationTypeMismatch { target, handle } => write!(
                 f,
-                "pointer {} is not registered as the requested {} allocation",
-                ptr, target
+                "handle {} is not registered as the requested {} allocation",
+                handle, target
             ),
             Self::ArenaShardSizeMismatch { expected, got } => write!(
                 f,
@@ -139,28 +177,145 @@ impl From<reed_solomon_simd::Error> for RepairError {
     }
 }
 
-type Registry = Mutex<HashMap<usize, Allocation>>;
+#[derive(Debug, Clone, Copy)]
+struct RegistryEntry {
+    ptr: usize,
+    allocation: Allocation,
+}
+
+#[derive(Debug, Clone)]
+struct RegistrySlot {
+    generation: u32,
+    entry: Option<RegistryEntry>,
+}
+
+#[derive(Debug, Default)]
+struct AllocationRegistry {
+    slots: Vec<RegistrySlot>,
+    reusable_slot_ids: Vec<u32>,
+}
+
+impl AllocationRegistry {
+    fn next_generation(current: u32) -> u32 {
+        let next = current.wrapping_add(1);
+        if next == 0 { 1 } else { next }
+    }
+
+    fn register(&mut self, ptr: usize, allocation: Allocation) -> AllocationHandle {
+        if let Some(reused_slot_id) = self.reusable_slot_ids.pop() {
+            let slot = &mut self.slots[(reused_slot_id - 1) as usize];
+            slot.generation = Self::next_generation(slot.generation);
+            slot.entry = Some(RegistryEntry { ptr, allocation });
+            return AllocationHandle::new(reused_slot_id, slot.generation);
+        }
+
+        let slot_id = (self.slots.len() + 1) as u32;
+        self.slots.push(RegistrySlot {
+            generation: 1,
+            entry: Some(RegistryEntry { ptr, allocation }),
+        });
+        AllocationHandle::new(slot_id, 1)
+    }
+
+    fn lookup(&self, handle: AllocationHandle, target: &'static str) -> Result<RegistryEntry, RepairError> {
+        if handle.is_null() {
+            return Err(RepairError::NullHandle { target });
+        }
+
+        let Some(slot_index) = handle.slot_index() else {
+            return Err(RepairError::UnknownHandle {
+                target,
+                handle: handle.into_raw(),
+            });
+        };
+
+        let Some(slot) = self.slots.get(slot_index) else {
+            return Err(RepairError::UnknownHandle {
+                target,
+                handle: handle.into_raw(),
+            });
+        };
+
+        if slot.generation != handle.generation() {
+            return Err(RepairError::UnknownHandle {
+                target,
+                handle: handle.into_raw(),
+            });
+        }
+
+        slot.entry.ok_or(RepairError::UnknownHandle {
+            target,
+            handle: handle.into_raw(),
+        })
+    }
+
+    fn remove(&mut self, handle: AllocationHandle, target: &'static str) -> Result<RegistryEntry, RepairError> {
+        if handle.is_null() {
+            return Err(RepairError::NullHandle { target });
+        }
+
+        let Some(slot_index) = handle.slot_index() else {
+            return Err(RepairError::UnknownHandle {
+                target,
+                handle: handle.into_raw(),
+            });
+        };
+
+        let Some(slot) = self.slots.get_mut(slot_index) else {
+            return Err(RepairError::UnknownHandle {
+                target,
+                handle: handle.into_raw(),
+            });
+        };
+
+        if slot.generation != handle.generation() {
+            return Err(RepairError::UnknownHandle {
+                target,
+                handle: handle.into_raw(),
+            });
+        }
+
+        let Some(entry) = slot.entry.take() else {
+            return Err(RepairError::UnknownHandle {
+                target,
+                handle: handle.into_raw(),
+            });
+        };
+
+        self.reusable_slot_ids.push((slot_index + 1) as u32);
+        Ok(entry)
+    }
+}
+
+type Registry = Mutex<AllocationRegistry>;
 
 fn allocation_registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    REGISTRY.get_or_init(|| Mutex::new(AllocationRegistry::default()))
 }
 
-fn register_allocation(ptr: usize, allocation: Allocation) {
+fn register_allocation(ptr: usize, allocation: Allocation) -> AllocationHandle {
     allocation_registry()
         .lock()
         .expect("allocation registry poisoned")
-        .insert(ptr, allocation);
+        .register(ptr, allocation)
 }
 
-fn remove_allocation(ptr: usize) -> Option<Allocation> {
+fn lookup_allocation(handle: AllocationHandle, target: &'static str) -> Result<RegistryEntry, RepairError> {
     allocation_registry()
         .lock()
         .expect("allocation registry poisoned")
-        .remove(&ptr)
+        .lookup(handle, target)
 }
 
-fn alloc_shard_arena_inner(slot_count: usize, shard_size: usize) -> Result<*mut u8, RepairError> {
+fn remove_allocation(handle: AllocationHandle, target: &'static str) -> Result<RegistryEntry, RepairError> {
+    allocation_registry()
+        .lock()
+        .expect("allocation registry poisoned")
+        .remove(handle, target)
+}
+
+fn alloc_shard_arena_inner(slot_count: usize, shard_size: usize) -> Result<AllocationHandle, RepairError> {
     if shard_size == 0 || shard_size % 2 != 0 {
         return Err(RepairError::InvalidShardSize { shard_size });
     }
@@ -175,7 +330,7 @@ fn alloc_shard_arena_inner(slot_count: usize, shard_size: usize) -> Result<*mut 
     let mut arena = vec![0_u8; byte_len];
     let ptr = arena.as_mut_ptr();
 
-    register_allocation(
+    let handle = register_allocation(
         ptr as usize,
         Allocation::ShardArena(ShardArenaMeta {
             byte_len,
@@ -186,105 +341,82 @@ fn alloc_shard_arena_inner(slot_count: usize, shard_size: usize) -> Result<*mut 
 
     std::mem::forget(arena);
 
-    Ok(ptr)
+    Ok(handle)
 }
 
-fn free_shard_arena_inner(ptr: *mut u8) -> Result<(), RepairError> {
-    if ptr.is_null() {
-        return Err(RepairError::NullPointer {
-            target: "shard arena",
-        });
-    }
-
-    match remove_allocation(ptr as usize) {
-        Some(Allocation::ShardArena(meta)) => {
+fn free_shard_arena_inner(handle: AllocationHandle) -> Result<(), RepairError> {
+    match remove_allocation(handle, "shard arena")? {
+        RegistryEntry {
+            ptr,
+            allocation: Allocation::ShardArena(meta),
+        } => {
             unsafe {
-                drop(Vec::from_raw_parts(ptr, meta.byte_len, meta.byte_len));
+                drop(Vec::from_raw_parts(ptr as *mut u8, meta.byte_len, meta.byte_len));
             }
             Ok(())
         }
-        Some(_) => Err(RepairError::AllocationTypeMismatch {
+        RegistryEntry { .. } => Err(RepairError::AllocationTypeMismatch {
             target: "shard arena",
-            ptr: ptr as usize,
-        }),
-        None => Err(RepairError::UnknownPointer {
-            target: "shard arena",
-            ptr: ptr as usize,
+            handle: handle.into_raw(),
         }),
     }
 }
 
-fn alloc_u32_buffer_inner(len: usize) -> *mut u32 {
+fn alloc_u32_buffer_inner(len: usize) -> AllocationHandle {
     if len == 0 {
-        return std::ptr::null_mut();
+        return AllocationHandle::null();
     }
 
     let mut buffer = vec![0_u32; len];
     let ptr = buffer.as_mut_ptr();
-    register_allocation(ptr as usize, Allocation::U32Buffer(U32BufferMeta { len }));
+    let handle = register_allocation(ptr as usize, Allocation::U32Buffer(U32BufferMeta { len }));
     std::mem::forget(buffer);
-    ptr
+    handle
 }
 
-fn free_u32_buffer_inner(ptr: *mut u32) -> Result<(), RepairError> {
-    if ptr.is_null() {
+fn free_u32_buffer_inner(handle: AllocationHandle) -> Result<(), RepairError> {
+    if handle.is_null() {
         return Ok(());
     }
 
-    match remove_allocation(ptr as usize) {
-        Some(Allocation::U32Buffer(meta)) => {
+    match remove_allocation(handle, "u32 buffer")? {
+        RegistryEntry {
+            ptr,
+            allocation: Allocation::U32Buffer(meta),
+        } => {
             unsafe {
-                drop(Vec::from_raw_parts(ptr, meta.len, meta.len));
+                drop(Vec::from_raw_parts(ptr as *mut u32, meta.len, meta.len));
             }
             Ok(())
         }
-        Some(_) => Err(RepairError::AllocationTypeMismatch {
+        RegistryEntry { .. } => Err(RepairError::AllocationTypeMismatch {
             target: "u32 buffer",
-            ptr: ptr as usize,
-        }),
-        None => Err(RepairError::UnknownPointer {
-            target: "u32 buffer",
-            ptr: ptr as usize,
+            handle: handle.into_raw(),
         }),
     }
 }
 
 fn with_registered_arena_mut<T>(
-    ptr: *mut u8,
+    handle: AllocationHandle,
     f: impl FnOnce(ShardArenaMeta, &mut [u8]) -> Result<T, RepairError>,
 ) -> Result<T, RepairError> {
-    if ptr.is_null() {
-        return Err(RepairError::NullPointer {
-            target: "shard arena",
-        });
-    }
-
-    let meta = {
-        let registry = allocation_registry();
-        let guard = registry.lock().expect("allocation registry poisoned");
-        match guard.get(&(ptr as usize)) {
-            Some(Allocation::ShardArena(meta)) => *meta,
-            Some(_) => {
-                return Err(RepairError::AllocationTypeMismatch {
-                    target: "shard arena",
-                    ptr: ptr as usize,
-                })
-            }
-            None => {
-                return Err(RepairError::UnknownPointer {
-                    target: "shard arena",
-                    ptr: ptr as usize,
-                })
-            }
+    let entry = lookup_allocation(handle, "shard arena")?;
+    let meta = match entry.allocation {
+        Allocation::ShardArena(meta) => meta,
+        _ => {
+            return Err(RepairError::AllocationTypeMismatch {
+                target: "shard arena",
+                handle: handle.into_raw(),
+            })
         }
     };
 
-    let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, meta.byte_len) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(entry.ptr as *mut u8, meta.byte_len) };
     f(meta, bytes)
 }
 
 fn with_registered_u32_slice<T>(
-    ptr: *const u32,
+    handle: AllocationHandle,
     len: usize,
     f: impl FnOnce(&[u32]) -> Result<T, RepairError>,
 ) -> Result<T, RepairError> {
@@ -292,29 +424,14 @@ fn with_registered_u32_slice<T>(
         return f(&[]);
     }
 
-    if ptr.is_null() {
-        return Err(RepairError::NullPointer {
-            target: "u32 buffer",
-        });
-    }
-
-    let meta = {
-        let registry = allocation_registry();
-        let guard = registry.lock().expect("allocation registry poisoned");
-        match guard.get(&(ptr as usize)) {
-            Some(Allocation::U32Buffer(meta)) => *meta,
-            Some(_) => {
-                return Err(RepairError::AllocationTypeMismatch {
-                    target: "u32 buffer",
-                    ptr: ptr as usize,
-                })
-            }
-            None => {
-                return Err(RepairError::UnknownPointer {
-                    target: "u32 buffer",
-                    ptr: ptr as usize,
-                })
-            }
+    let entry = lookup_allocation(handle, "u32 buffer")?;
+    let meta = match entry.allocation {
+        Allocation::U32Buffer(meta) => meta,
+        _ => {
+            return Err(RepairError::AllocationTypeMismatch {
+                target: "u32 buffer",
+                handle: handle.into_raw(),
+            })
         }
     };
 
@@ -325,8 +442,30 @@ fn with_registered_u32_slice<T>(
         )));
     }
 
-    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let slice = unsafe { std::slice::from_raw_parts(entry.ptr as *const u32, len) };
     f(slice)
+}
+
+fn shard_arena_ptr_inner(handle: AllocationHandle) -> Result<*mut u8, RepairError> {
+    let entry = lookup_allocation(handle, "shard arena")?;
+    match entry.allocation {
+        Allocation::ShardArena(_) => Ok(entry.ptr as *mut u8),
+        _ => Err(RepairError::AllocationTypeMismatch {
+            target: "shard arena",
+            handle: handle.into_raw(),
+        }),
+    }
+}
+
+fn u32_buffer_ptr_inner(handle: AllocationHandle) -> Result<*mut u32, RepairError> {
+    let entry = lookup_allocation(handle, "u32 buffer")?;
+    match entry.allocation {
+        Allocation::U32Buffer(_) => Ok(entry.ptr as *mut u32),
+        _ => Err(RepairError::AllocationTypeMismatch {
+            target: "u32 buffer",
+            handle: handle.into_raw(),
+        }),
+    }
 }
 
 fn shard_slice(bytes: &[u8], shard_size: usize, slot_index: usize) -> &[u8] {
@@ -543,26 +682,36 @@ fn encode_in_place(
     Ok(recovery_count)
 }
 
-pub fn alloc_shard_arena(slot_count: usize, shard_size: usize) -> Result<*mut u8, RepairError> {
+pub fn alloc_shard_arena(slot_count: usize, shard_size: usize) -> Result<AllocationHandle, RepairError> {
     alloc_shard_arena_inner(slot_count, shard_size)
 }
 
 /// Release a shard arena previously created by [`alloc_shard_arena`].
-pub fn free_shard_arena(ptr: *mut u8) -> Result<(), RepairError> {
-    free_shard_arena_inner(ptr)
+pub fn free_shard_arena(handle: AllocationHandle) -> Result<(), RepairError> {
+    free_shard_arena_inner(handle)
+}
+
+/// Resolve a live shard arena handle to its current linear-memory pointer.
+pub fn shard_arena_ptr(handle: AllocationHandle) -> Result<*mut u8, RepairError> {
+    shard_arena_ptr_inner(handle)
 }
 
 /// Allocate a `u32` buffer inside linear memory for missing-index lists.
 ///
 /// A zero-length request returns a null pointer so callers can naturally model the "no missing
 /// indices" case without paying for an unnecessary allocation.
-pub fn alloc_u32_buffer(len: usize) -> *mut u32 {
+pub fn alloc_u32_buffer(len: usize) -> AllocationHandle {
     alloc_u32_buffer_inner(len)
 }
 
 /// Release a buffer previously created by [`alloc_u32_buffer`].
-pub fn free_u32_buffer(ptr: *mut u32) -> Result<(), RepairError> {
-    free_u32_buffer_inner(ptr)
+pub fn free_u32_buffer(handle: AllocationHandle) -> Result<(), RepairError> {
+    free_u32_buffer_inner(handle)
+}
+
+/// Resolve a live `u32` buffer handle to its current linear-memory pointer.
+pub fn u32_buffer_ptr(handle: AllocationHandle) -> Result<*mut u32, RepairError> {
+    u32_buffer_ptr_inner(handle)
 }
 
 /// Repair the missing shard slots recorded in `missing_indices`.
@@ -574,9 +723,9 @@ pub fn leopard_repair(
     original_count: usize,
     shard_size: usize,
     missing_indices: &[u32],
-    shard_ptr: *mut u8,
+    shard_handle: AllocationHandle,
 ) -> Result<usize, RepairError> {
-    with_registered_arena_mut(shard_ptr, |meta, bytes| {
+    with_registered_arena_mut(shard_handle, |meta, bytes| {
         if meta.shard_size != shard_size {
             return Err(RepairError::ArenaShardSizeMismatch {
                 expected: meta.shard_size,
@@ -601,9 +750,9 @@ pub fn leopard_repair(
 pub fn leopard_encode(
     original_count: usize,
     shard_size: usize,
-    shard_ptr: *mut u8,
+    shard_handle: AllocationHandle,
 ) -> Result<usize, RepairError> {
-    with_registered_arena_mut(shard_ptr, |meta, bytes| {
+    with_registered_arena_mut(shard_handle, |meta, bytes| {
         if meta.shard_size != shard_size {
             return Err(RepairError::ArenaShardSizeMismatch {
                 expected: meta.shard_size,
@@ -617,28 +766,46 @@ pub fn leopard_encode(
 
 #[wasm_bindgen(js_name = alloc_shard_arena)]
 /// JavaScript/Wasm binding for [`alloc_shard_arena`].
-pub fn alloc_shard_arena_js(slot_count: usize, shard_size: usize) -> Result<usize, JsValue> {
+pub fn alloc_shard_arena_js(slot_count: usize, shard_size: usize) -> Result<u64, JsValue> {
     alloc_shard_arena(slot_count, shard_size)
-        .map(|ptr| ptr as usize)
+        .map(AllocationHandle::into_raw)
         .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 #[wasm_bindgen(js_name = free_shard_arena)]
 /// JavaScript/Wasm binding for [`free_shard_arena`].
-pub fn free_shard_arena_js(ptr: usize) -> Result<(), JsValue> {
-    free_shard_arena(ptr as *mut u8).map_err(|error| JsValue::from_str(&error.to_string()))
+pub fn free_shard_arena_js(handle: u64) -> Result<(), JsValue> {
+    free_shard_arena(AllocationHandle::from_raw(handle))
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+#[wasm_bindgen(js_name = shard_arena_ptr)]
+/// JavaScript/Wasm binding for [`shard_arena_ptr`].
+pub fn shard_arena_ptr_js(handle: u64) -> Result<usize, JsValue> {
+    shard_arena_ptr(AllocationHandle::from_raw(handle))
+        .map(|ptr| ptr as usize)
+        .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 #[wasm_bindgen(js_name = alloc_u32_buffer)]
 /// JavaScript/Wasm binding for [`alloc_u32_buffer`].
-pub fn alloc_u32_buffer_js(len: usize) -> usize {
-    alloc_u32_buffer(len) as usize
+pub fn alloc_u32_buffer_js(len: usize) -> u64 {
+    alloc_u32_buffer(len).into_raw()
 }
 
 #[wasm_bindgen(js_name = free_u32_buffer)]
 /// JavaScript/Wasm binding for [`free_u32_buffer`].
-pub fn free_u32_buffer_js(ptr: usize) -> Result<(), JsValue> {
-    free_u32_buffer(ptr as *mut u32).map_err(|error| JsValue::from_str(&error.to_string()))
+pub fn free_u32_buffer_js(handle: u64) -> Result<(), JsValue> {
+    free_u32_buffer(AllocationHandle::from_raw(handle))
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+#[wasm_bindgen(js_name = u32_buffer_ptr)]
+/// JavaScript/Wasm binding for [`u32_buffer_ptr`].
+pub fn u32_buffer_ptr_js(handle: u64) -> Result<usize, JsValue> {
+    u32_buffer_ptr(AllocationHandle::from_raw(handle))
+        .map(|ptr| ptr as usize)
+        .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 #[wasm_bindgen(js_name = leopard_repair)]
@@ -646,19 +813,19 @@ pub fn free_u32_buffer_js(ptr: usize) -> Result<(), JsValue> {
 pub fn leopard_repair_js(
     original_count: usize,
     shard_size: usize,
-    missing_indices_ptr: usize,
+    missing_indices_handle: u64,
     missing_indices_len: usize,
-    shard_ptr: usize,
+    shard_handle: u64,
 ) -> Result<usize, JsValue> {
     with_registered_u32_slice(
-        missing_indices_ptr as *const u32,
+        AllocationHandle::from_raw(missing_indices_handle),
         missing_indices_len,
         |missing_indices| {
             leopard_repair(
                 original_count,
                 shard_size,
                 missing_indices,
-                shard_ptr as *mut u8,
+                AllocationHandle::from_raw(shard_handle),
             )
         },
     )
@@ -670,9 +837,9 @@ pub fn leopard_repair_js(
 pub fn leopard_encode_js(
     original_count: usize,
     shard_size: usize,
-    shard_ptr: usize,
+    shard_handle: u64,
 ) -> Result<usize, JsValue> {
-    leopard_encode(original_count, shard_size, shard_ptr as *mut u8)
+    leopard_encode(original_count, shard_size, AllocationHandle::from_raw(shard_handle))
         .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
@@ -709,13 +876,16 @@ mod tests {
     }
 
     struct OwnedShardArena {
+        handle: AllocationHandle,
         ptr: *mut u8,
     }
 
     impl OwnedShardArena {
         fn new(slot_count: usize, shard_size: usize) -> Self {
+            let handle = alloc_shard_arena(slot_count, shard_size).expect("arena allocation failed");
             Self {
-                ptr: alloc_shard_arena(slot_count, shard_size).expect("arena allocation failed"),
+                ptr: shard_arena_ptr(handle).expect("arena pointer lookup failed"),
+                handle,
             }
         }
 
@@ -726,26 +896,33 @@ mod tests {
 
     impl Drop for OwnedShardArena {
         fn drop(&mut self) {
-            if !self.ptr.is_null() {
-                free_shard_arena(self.ptr).expect("arena free failed");
+            if !self.handle.is_null() {
+                free_shard_arena(self.handle).expect("arena free failed");
             }
         }
     }
 
     struct OwnedU32Buffer {
+        handle: AllocationHandle,
         ptr: *mut u32,
         len: usize,
     }
 
     impl OwnedU32Buffer {
         fn new(values: &[u32]) -> Self {
-            let ptr = alloc_u32_buffer(values.len());
+            let handle = alloc_u32_buffer(values.len());
+            let ptr = if handle.is_null() {
+                std::ptr::null_mut()
+            } else {
+                u32_buffer_ptr(handle).expect("u32 buffer pointer lookup failed")
+            };
             if !ptr.is_null() {
                 unsafe {
                     std::slice::from_raw_parts_mut(ptr, values.len()).copy_from_slice(values);
                 }
             }
             Self {
+                handle,
                 ptr,
                 len: values.len(),
             }
@@ -755,7 +932,7 @@ mod tests {
     impl Drop for OwnedU32Buffer {
         fn drop(&mut self) {
             if self.len > 0 {
-                free_u32_buffer(self.ptr).expect("u32 buffer free failed");
+                free_u32_buffer(self.handle).expect("u32 buffer free failed");
             }
         }
     }
@@ -800,7 +977,6 @@ mod tests {
     fn run_encode_case(case: &EncodeCase) -> Vec<Vec<u8>> {
         let slot_count = case.slot_count();
         let mut arena = OwnedShardArena::new(slot_count, case.shard_size);
-        let arena_ptr = arena.ptr;
 
         {
             let bytes = arena.bytes_mut(case.byte_len());
@@ -812,7 +988,7 @@ mod tests {
         }
 
         let encoded_count =
-            leopard_encode(case.original_count, case.shard_size, arena_ptr).expect("encoding should succeed");
+            leopard_encode(case.original_count, case.shard_size, arena.handle).expect("encoding should succeed");
 
         assert_eq!(encoded_count, case.recovery_count);
 
@@ -832,7 +1008,6 @@ mod tests {
 
         let mut arena = OwnedShardArena::new(slot_count, case.shard_size);
         let missing = OwnedU32Buffer::new(&missing_u32);
-        let arena_ptr = arena.ptr as usize;
 
         {
             let bytes = arena.bytes_mut(byte_len);
@@ -851,7 +1026,7 @@ mod tests {
             case.original_count,
             case.shard_size,
             unsafe { std::slice::from_raw_parts(missing.ptr, missing.len) },
-            arena_ptr as *mut u8,
+            arena.handle,
         )
         .expect("repair should succeed");
 
@@ -900,7 +1075,6 @@ mod tests {
             .collect::<Vec<_>>();
         let expected_recovery = encode_reference_recovery(&original_shards, recovery_count);
         let mut arena = OwnedShardArena::new(original_count + recovery_count, shard_size);
-        let arena_ptr = arena.ptr;
 
         {
             let bytes = arena.bytes_mut((original_count + recovery_count) * shard_size);
@@ -911,7 +1085,7 @@ mod tests {
             }
         }
 
-        let encoded_count = leopard_encode(original_count, shard_size, arena_ptr)
+        let encoded_count = leopard_encode(original_count, shard_size, arena.handle)
             .expect("encoding should succeed");
 
         assert_eq!(encoded_count, recovery_count);
@@ -944,7 +1118,7 @@ mod tests {
             4,
             shard_size,
             unsafe { std::slice::from_raw_parts(missing.ptr, missing.len) },
-            arena.ptr,
+            arena.handle,
         )
         .expect_err("repair should fail when too many shards are missing");
 
@@ -955,6 +1129,41 @@ mod tests {
                 available_count: 2,
             }
         );
+    }
+
+    #[test]
+    fn rejects_stale_handles_when_pointer_addresses_are_reused() {
+        let arena_meta = ShardArenaMeta {
+            byte_len: 64,
+            slot_count: 2,
+            shard_size: 32,
+        };
+        let mut registry = AllocationRegistry::default();
+        let first = registry.register(0x1000, Allocation::ShardArena(arena_meta));
+
+        let removed = registry
+            .remove(first, "shard arena")
+            .expect("first handle should remove cleanly");
+        assert_eq!(removed.ptr, 0x1000);
+
+        let second = registry.register(0x1000, Allocation::ShardArena(arena_meta));
+        assert_ne!(first.into_raw(), second.into_raw());
+
+        let error = registry
+            .lookup(first, "shard arena")
+            .expect_err("stale handle should fail after slot reuse");
+        assert_eq!(
+            error,
+            RepairError::UnknownHandle {
+                target: "shard arena",
+                handle: first.into_raw(),
+            }
+        );
+
+        let entry = registry
+            .lookup(second, "shard arena")
+            .expect("fresh handle should resolve");
+        assert_eq!(entry.ptr, 0x1000);
     }
 
     prop_compose! {
@@ -1054,7 +1263,7 @@ mod tests {
 
             write_slots(&mut arena, case.shard_size, &reference);
 
-            let repaired_count = leopard_repair(case.original_count, case.shard_size, &[], arena.ptr)
+            let repaired_count = leopard_repair(case.original_count, case.shard_size, &[], arena.handle)
                 .expect("repair without missing indices should succeed");
 
             prop_assert_eq!(repaired_count, 0);
@@ -1075,7 +1284,7 @@ mod tests {
                 case.original_count,
                 case.shard_size,
                 unsafe { std::slice::from_raw_parts(missing.ptr, missing.len) },
-                arena.ptr,
+                arena.handle,
             )
             .expect_err("duplicate missing indices should fail");
 
@@ -1095,7 +1304,7 @@ mod tests {
                 case.original_count,
                 case.shard_size,
                 unsafe { std::slice::from_raw_parts(missing.ptr, missing.len) },
-                arena.ptr,
+                arena.handle,
             )
             .expect_err("out-of-range missing indices should fail");
 

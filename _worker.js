@@ -12,10 +12,12 @@
  * correct repairs when a client intentionally omits unneeded recovery shards from the request.
  */
 
-import { MultipartParseError, parseMultipartRequest } from "@mjackson/multipart-parser";
+import { MultipartParseError, MultipartStreamReader, parseMultipartBoundary } from "./lib/multipart.js";
 import { Par3 } from "./lib/mod.js";
 
 const encoder = new TextEncoder();
+const MAX_METADATA_BYTES = 64 * 1024;
+const SHA256_HEX_PATTERN = /^[0-9a-fA-F]{64}$/;
 const SHARD_PART_NAME = /^shard_(\d+)$/;
 const wasmReady = Promise.resolve();
 
@@ -29,6 +31,64 @@ class HttpError extends Error {
 
 function badRequest(message) {
   return new HttpError(400, message);
+}
+
+function toHex(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function readTextPart(parser, { fieldName, maxBytes } = {}) {
+  const textDecoder = new TextDecoder();
+  let text = "";
+  let totalBytes = 0;
+
+  const hasNextPart = await parser.readPartBody(async (chunk) => {
+    totalBytes += chunk.byteLength;
+    if (totalBytes > maxBytes) {
+      throw new HttpError(413, `${fieldName} exceeds maximum size of ${maxBytes} bytes`);
+    }
+
+    text += textDecoder.decode(chunk, { stream: true });
+  });
+
+  return {
+    hasNextPart,
+    text: text + textDecoder.decode(),
+  };
+}
+
+function parseDigests(rawDigests, slotCount) {
+  if (rawDigests === undefined) {
+    return null;
+  }
+
+  if (!Array.isArray(rawDigests)) {
+    throw badRequest("digests must be an array of SHA-256 hex strings or null values");
+  }
+
+  if (rawDigests.length !== slotCount) {
+    throw badRequest(`digests must contain exactly ${slotCount} entries`);
+  }
+
+  return rawDigests.map((digest, index) => {
+    if (digest === null) {
+      return null;
+    }
+
+    if (typeof digest !== "string") {
+      throw badRequest(
+        `digests[${index}] must be a 64-character hexadecimal SHA-256 digest or null`,
+      );
+    }
+
+    if (!SHA256_HEX_PATTERN.test(digest)) {
+      throw badRequest(
+        `digests[${index}] must be a 64-character hexadecimal SHA-256 digest or null`,
+      );
+    }
+
+    return digest.toLowerCase();
+  });
 }
 
 /**
@@ -57,17 +117,29 @@ function parseMetadata(text) {
     createError,
   });
 
-  return new Par3(layout, { createError });
+  if (!layout.slotCountLocked) {
+    throw badRequest("metadata must declare recovery_count or total_shard_count");
+  }
+
+  return {
+    codec: new Par3(layout, { createError }),
+    slotDigests: parseDigests(parsed.digests, layout.slotCount),
+  };
 }
 
 function createState() {
   return {
     codec: null,
+    slotDigests: null,
   };
 }
 
 function currentMissingIndices(state) {
-  return state.codec.currentRequestedMissingIndices();
+  if (state.codec.currentRequestedMissingIndices().length === 0) {
+    return [];
+  }
+
+  return state.codec.selectOutputIndices();
 }
 
 function freeArena(state) {
@@ -76,6 +148,7 @@ function freeArena(state) {
   }
 
   state.codec.free();
+  state.codec = null;
 }
 
 /**
@@ -93,21 +166,23 @@ function ensureArenaCapacity(state, requiredSlotCount) {
   state.codec.ensureCapacity(requiredSlotCount);
 }
 
-async function drainReadableStream(stream) {
-  const reader = stream.getReader();
-  try {
-    while (true) {
-      const { done } = await reader.read();
-      if (done) {
-        break;
-      }
-    }
-  } finally {
-    reader.releaseLock();
+async function verifyShardDigest(slotIndex, bytes, state) {
+  const expectedDigest = state.slotDigests?.[slotIndex] ?? null;
+  if (!expectedDigest) {
+    return;
+  }
+
+  const digestBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  if (toHex(digestBytes) !== expectedDigest) {
+    throw new HttpError(422, `digest mismatch for slot ${slotIndex}`);
   }
 }
 
-async function writeShardPart(part, slotIndex, state) {
+async function skipPart(parser) {
+  return parser.readPartBody(async () => {});
+}
+
+async function writeShardPart(parser, partName, slotIndex, state) {
   ensureArenaCapacity(state, slotIndex + 1);
 
   if (state.codec.receivedIndices.has(slotIndex)) {
@@ -116,37 +191,29 @@ async function writeShardPart(part, slotIndex, state) {
 
   const target = state.codec.prepareWritableShard(slotIndex);
   let written = 0;
-  const reader = part.body.getReader();
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-
-      if (written + value.byteLength > state.codec.shardSize) {
-        throw new HttpError(
-          400,
-          `part ${part.name} exceeds declared shard_size ${state.codec.shardSize}`,
-        );
-      }
-
-      target.set(value, written);
-      written += value.byteLength;
+  const hasNextPart = await parser.readPartBody(async (chunk) => {
+    if (written + chunk.byteLength > state.codec.shardSize) {
+      throw new HttpError(
+        400,
+        `part ${partName} exceeds declared shard_size ${state.codec.shardSize}`,
+      );
     }
-  } finally {
-    reader.releaseLock();
-  }
+
+    target.set(chunk, written);
+    written += chunk.byteLength;
+  });
 
   if (written !== state.codec.shardSize) {
     throw new HttpError(
       400,
-      `part ${part.name} wrote ${written} bytes but shard_size is ${state.codec.shardSize}`,
+      `part ${partName} wrote ${written} bytes but shard_size is ${state.codec.shardSize}`,
     );
   }
 
+  await verifyShardDigest(slotIndex, target, state);
   state.codec.commitShard(slotIndex);
+  return hasNextPart;
 }
 
 function thresholdReached(state) {
@@ -161,42 +228,38 @@ function thresholdReached(state) {
  */
 function createMultipartResponse(state, missingIndices) {
   const boundary = `par3-${crypto.randomUUID()}`;
-  let freed = false;
-
-  const releaseArena = () => {
-    if (freed) {
-      return;
-    }
-
-    freed = true;
-    freeArena(state);
-  };
+  let nextIndex = 0;
 
   const body = new ReadableStream({
-    async start(controller) {
+    pull(controller) {
       try {
-        for (const index of missingIndices) {
-          controller.enqueue(
-            encoder.encode(
-              `--${boundary}\r\n` +
-              `Content-Disposition: form-data; name="shard_${index}"; filename="shard_${index}.bin"\r\n` +
-              `Content-Type: application/octet-stream\r\n` +
-              `X-Shard-Index: ${index}\r\n\r\n`,
-            ),
-          );
-
-          controller.enqueue(state.codec.readShard(index));
-          controller.enqueue(encoder.encode("\r\n"));
+        if (nextIndex >= missingIndices.length) {
+          controller.enqueue(encoder.encode(`--${boundary}--\r\n`));
+          controller.close();
+          freeArena(state);
+          return;
         }
 
-        controller.enqueue(encoder.encode(`--${boundary}--\r\n`));
-        controller.close();
-      } finally {
-        releaseArena();
+        const index = missingIndices[nextIndex];
+        nextIndex += 1;
+
+        controller.enqueue(
+          encoder.encode(
+            `--${boundary}\r\n` +
+            `Content-Disposition: form-data; name="shard_${index}"; filename="shard_${index}.bin"\r\n` +
+            `Content-Type: application/octet-stream\r\n` +
+            `X-Shard-Index: ${index}\r\n\r\n`,
+          ),
+        );
+        controller.enqueue(state.codec.readShard(index));
+        controller.enqueue(encoder.encode("\r\n"));
+      } catch (error) {
+        freeArena(state);
+        throw error;
       }
     },
     cancel() {
-      releaseArena();
+      freeArena(state);
     },
   });
 
@@ -219,27 +282,42 @@ function createMultipartResponse(state, missingIndices) {
  */
 async function ingestRequest(request) {
   const state = createState();
+  const parser = new MultipartStreamReader(
+    request.body,
+    parseMultipartBoundary(request.headers.get("content-type")),
+  );
 
   try {
-    for await (const part of parseMultipartRequest(request)) {
+    let hasNextPart = await parser.start();
+    while (hasNextPart) {
+      const part = await parser.readHeaders();
+
       if (part.name === "metadata") {
         if (state.codec) {
           throw new HttpError(400, "metadata part may only appear once");
         }
 
-        state.codec = parseMetadata(await part.text());
+        const metadataText = await readTextPart(parser, {
+          fieldName: "metadata",
+          maxBytes: MAX_METADATA_BYTES,
+        });
+        const metadata = parseMetadata(metadataText.text);
+        state.codec = metadata.codec;
+        state.slotDigests = metadata.slotDigests;
         ensureArenaCapacity(state, state.codec.slotCount);
+        hasNextPart = metadataText.hasNextPart;
       } else {
         const match = SHARD_PART_NAME.exec(part.name);
         if (!match) {
-          await drainReadableStream(part.body);
+          hasNextPart = await skipPart(parser);
         } else {
           const slotIndex = Par3.assertInteger(Number.parseInt(match[1], 10), part.name, 0, badRequest);
-          await writeShardPart(part, slotIndex, state);
+          hasNextPart = await writeShardPart(parser, part.name, slotIndex, state);
         }
       }
 
       if (thresholdReached(state)) {
+        await parser.cancel("repair threshold reached");
         break;
       }
     }
@@ -251,6 +329,7 @@ async function ingestRequest(request) {
     const responseMissingIndices = currentMissingIndices(state);
     if (responseMissingIndices.length === 0) {
       freeArena(state);
+      parser.release();
       return { nothingToRepair: true };
     }
 
@@ -263,9 +342,12 @@ async function ingestRequest(request) {
 
     state.codec.repair();
 
+    parser.release();
     return { state, missingIndices: responseMissingIndices };
   } catch (error) {
+    await parser.cancel("request ingestion failed");
     freeArena(state);
+    parser.release();
     throw error;
   }
 }

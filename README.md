@@ -54,6 +54,11 @@ npm run build
 This runs `scripts/build-wasm.sh`, which ensures the `wasm32-unknown-unknown` target is present and
 builds the package into `pkg/` with `simd128` enabled.
 
+The `-C target-feature=+simd128` flag is currently future-proofing rather than an active fast path
+for this dependency stack. `reed-solomon-simd` 3.1.0 documents optimized engines for SSSE3, AVX2,
+and NEON, but no WebAssembly SIMD backend, so the wasm build currently falls back to the scalar
+engine.
+
 ## Test
 
 ```bash
@@ -85,9 +90,20 @@ parts are named `shard_<slotIndex>`.
 Metadata fields:
 
 - `original_count`: number of original data shards
-- `recovery_count`: number of recovery shards, or omit this and provide `total_shard_count`
+- `recovery_count`: number of recovery shards, or provide `total_shard_count`
 - `shard_size`: shard size in bytes, must be even
 - `missing_indices`: shard indexes the caller wants returned
+- `digests`: optional per-slot SHA-256 digests as lowercase hex strings or `null`, aligned to the
+  declared slot count
+
+The Worker now requires a locked slot count for streaming safety. Include either `recovery_count`
+or `total_shard_count`; requests that rely on slot-count inference are rejected.
+
+Resource caps enforced before any wasm allocation:
+
+- `total_shard_count <= 32768`
+- `shard_size <= 10485760` (10 MiB)
+- `total_shard_count * shard_size <= 134217728` (128 MiB)
 
 Example metadata payload:
 
@@ -115,6 +131,8 @@ Important runtime rule:
 
 - The Worker only returns shard indexes listed in `missing_indices`.
 - The codec still needs every unreceived slot marked as missing before repair.
+- If `digests` are provided, every received shard is verified before it is committed to the repair
+  set.
 
 Worker compatibility is declared explicitly in `wrangler.toml` via
 `compatibility_flags = ["nodejs_compat"]`.

@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { runCli } from "./main.js";
 import packageMetadata from "../package.json" with { type: "json" };
 import * as wasmModule from "../pkg/par3_bg.wasm";
-import { alloc_shard_arena, free_shard_arena, leopard_encode } from "../pkg/par3.js";
+import { alloc_shard_arena, free_shard_arena, leopard_encode, shard_arena_ptr } from "../pkg/par3.js";
 
 const { memory } = wasmModule;
 const execFileAsync = promisify(execFile);
@@ -36,7 +36,8 @@ async function buildRecoveryShards(originalShards, recoveryCount) {
   const originalCount = originalShards.length;
   const shardSize = originalShards[0].byteLength;
   const slotCount = originalCount + recoveryCount;
-  const arenaPtr = alloc_shard_arena(slotCount, shardSize);
+  const arenaHandle = alloc_shard_arena(slotCount, shardSize);
+  const arenaPtr = shard_arena_ptr(arenaHandle);
 
   try {
     const bytes = new Uint8Array(memory.buffer, arenaPtr, slotCount * shardSize);
@@ -44,14 +45,14 @@ async function buildRecoveryShards(originalShards, recoveryCount) {
       bytes.set(originalShards[index], index * shardSize);
     }
 
-    leopard_encode(originalCount, shardSize, arenaPtr);
+    leopard_encode(originalCount, shardSize, arenaHandle);
 
     const encodedBytes = new Uint8Array(memory.buffer, arenaPtr, slotCount * shardSize);
     return Array.from({ length: recoveryCount }, (_, recoveryIndex) =>
       Uint8Array.from(shardAt(encodedBytes, shardSize, originalCount + recoveryIndex)),
     );
   } finally {
-    free_shard_arena(arenaPtr);
+    free_shard_arena(arenaHandle);
   }
 }
 

@@ -17,10 +17,15 @@ This repository is intentionally set up for small, validated changes.
 - Read linear memory from `pkg/par3_bg.wasm`, not from `pkg/par3.js`.
 - Worker repairs must mark every unreceived slot as missing, even when only a subset of repaired
   shards are returned to the client.
+- Worker requests must declare `recovery_count` or `total_shard_count`; the Worker no longer grows
+  layouts on the fly.
 - Keep the Worker request path streaming. Do not rewrite it to buffer the full multipart body.
 - Shared shard repair state lives in `lib/mod.js` via the `Par3` class. Prefer changing that
   shared layer before duplicating behavior in `_worker.js` or `bin/main.js`.
 - The CLI implementation and executable entrypoint both live in `bin/main.js`.
+- `reed-solomon-simd` 3.1.0 has optimized SSSE3/AVX2/Neon engines but no wasm SIMD backend; the
+  wasm build currently runs the scalar engine even though `scripts/build-wasm.sh` keeps
+  `-C target-feature=+simd128` enabled for future compatibility.
 
 ## Preferred validation order
 
