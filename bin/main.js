@@ -178,7 +178,7 @@ export async function createShardSet({
       });
     }
 
-    const outputFiles = await writeOutputShards(codec, codec.encode(), outputDir);
+    const outputFiles = await writeOutputShards(codec, await codec.encode(), outputDir);
     return { outputFiles };
   } finally {
     codec.free();
@@ -217,7 +217,7 @@ export async function repairShardSet({
       };
     }
 
-    codec.repair();
+    await codec.repair();
     const outputFiles = await writeOutputShards(codec, outputIndices, outputDir);
 
     return {

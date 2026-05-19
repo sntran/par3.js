@@ -45,7 +45,7 @@ async function buildRecoveryShards(originalShards, recoveryCount) {
       bytes.set(originalShards[index], index * shardSize);
     }
 
-    leopard_encode(originalCount, shardSize, arenaHandle);
+    leopard_encode(originalCount, shardSize, 0, shardSize, arenaHandle);
 
     const encodedBytes = new Uint8Array(memory.buffer, arenaPtr, slotCount * shardSize);
     return Array.from({ length: recoveryCount }, (_, recoveryIndex) =>

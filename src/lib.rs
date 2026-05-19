@@ -9,6 +9,25 @@
 //! arenas directly from Web Streams or filesystem reads. Tests exercise the exact same low-level
 //! entrypoints so that the native suite stays close to production behavior.
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use core::arch::wasm32::{
+    u8x16_shr, u8x16_splat, u8x16_swizzle, v128, v128_and, v128_load, v128_store, v128_xor,
+};
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use core::iter::zip;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use reed_solomon_simd::engine::{
+    tables::{self, Mul128, Multiply128lutT, Skew},
+    utils as rs_engine_utils,
+    Engine as ReedSolomonEngine,
+    GfElement,
+    ShardsRefMut,
+    GF_MODULUS,
+    GF_ORDER,
+};
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+use reed_solomon_simd::engine::DefaultEngine;
+use reed_solomon_simd::rate::{DefaultRateDecoder, DefaultRateEncoder, RateDecoder, RateEncoder};
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
@@ -86,6 +105,11 @@ pub enum RepairError {
     AllocationTooLarge { slot_count: usize, shard_size: usize },
     ZeroOriginalCount,
     InvalidShardSize { shard_size: usize },
+    InvalidChunkRange {
+        chunk_offset: usize,
+        chunk_length: usize,
+        shard_size: usize,
+    },
     NullHandle { target: &'static str },
     UnknownHandle { target: &'static str, handle: u64 },
     AllocationTypeMismatch { target: &'static str, handle: u64 },
@@ -116,6 +140,15 @@ impl Display for RepairError {
                 f,
                 "shard_size must be non-zero and even, got {}",
                 shard_size
+            ),
+            Self::InvalidChunkRange {
+                chunk_offset,
+                chunk_length,
+                shard_size,
+            } => write!(
+                f,
+                "chunk range must be non-zero, start on a 64-byte boundary, and only end off-boundary at the true shard tail of {} bytes: offset={}, length={}",
+                shard_size, chunk_offset, chunk_length
             ),
             Self::NullHandle { target } => write!(f, "null handle for {}", target),
             Self::UnknownHandle { target, handle } => {
@@ -180,6 +213,412 @@ impl From<reed_solomon_simd::Error> for RepairError {
     fn from(error: reed_solomon_simd::Error) -> Self {
         Self::Codec(error.to_string())
     }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[derive(Clone, Copy)]
+struct WasmSimdEngine {
+    mul128: &'static Mul128,
+    skew: &'static Skew,
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+impl WasmSimdEngine {
+    fn new() -> Self {
+        Self {
+            mul128: tables::get_mul128(),
+            skew: tables::get_skew(),
+        }
+    }
+
+    #[target_feature(enable = "simd128")]
+    unsafe fn xor_chunk(x: &mut [u8; 64], y: &[u8; 64]) {
+        let x_ptr = x.as_mut_ptr().cast::<v128>();
+        let y_ptr = y.as_ptr().cast::<v128>();
+
+        let x0 = unsafe { v128_load(x_ptr) };
+        let x1 = unsafe { v128_load(x_ptr.add(1)) };
+        let x2 = unsafe { v128_load(x_ptr.add(2)) };
+        let x3 = unsafe { v128_load(x_ptr.add(3)) };
+
+        let y0 = unsafe { v128_load(y_ptr) };
+        let y1 = unsafe { v128_load(y_ptr.add(1)) };
+        let y2 = unsafe { v128_load(y_ptr.add(2)) };
+        let y3 = unsafe { v128_load(y_ptr.add(3)) };
+
+        unsafe {
+            v128_store(x_ptr, v128_xor(x0, y0));
+            v128_store(x_ptr.add(1), v128_xor(x1, y1));
+            v128_store(x_ptr.add(2), v128_xor(x2, y2));
+            v128_store(x_ptr.add(3), v128_xor(x3, y3));
+        }
+    }
+
+    #[target_feature(enable = "simd128")]
+    unsafe fn xor_chunks(&self, xs: &mut [[u8; 64]], ys: &[[u8; 64]]) {
+        for (x_chunk, y_chunk) in zip(xs.iter_mut(), ys.iter()) {
+            unsafe { Self::xor_chunk(x_chunk, y_chunk) };
+        }
+    }
+
+    #[target_feature(enable = "simd128")]
+    unsafe fn mul_128(value_lo: v128, value_hi: v128, lut: &Multiply128lutT) -> (v128, v128) {
+        let t0_lo = unsafe { v128_load(core::ptr::from_ref(&lut.lo[0]).cast::<v128>()) };
+        let t1_lo = unsafe { v128_load(core::ptr::from_ref(&lut.lo[1]).cast::<v128>()) };
+        let t2_lo = unsafe { v128_load(core::ptr::from_ref(&lut.lo[2]).cast::<v128>()) };
+        let t3_lo = unsafe { v128_load(core::ptr::from_ref(&lut.lo[3]).cast::<v128>()) };
+
+        let t0_hi = unsafe { v128_load(core::ptr::from_ref(&lut.hi[0]).cast::<v128>()) };
+        let t1_hi = unsafe { v128_load(core::ptr::from_ref(&lut.hi[1]).cast::<v128>()) };
+        let t2_hi = unsafe { v128_load(core::ptr::from_ref(&lut.hi[2]).cast::<v128>()) };
+        let t3_hi = unsafe { v128_load(core::ptr::from_ref(&lut.hi[3]).cast::<v128>()) };
+
+        let clear_mask = u8x16_splat(0x0f);
+
+        let data0 = v128_and(value_lo, clear_mask);
+        let mut prod_lo = u8x16_swizzle(t0_lo, data0);
+        let mut prod_hi = u8x16_swizzle(t0_hi, data0);
+
+        let data1 = v128_and(u8x16_shr(value_lo, 4), clear_mask);
+        prod_lo = v128_xor(prod_lo, u8x16_swizzle(t1_lo, data1));
+        prod_hi = v128_xor(prod_hi, u8x16_swizzle(t1_hi, data1));
+
+        let data2 = v128_and(value_hi, clear_mask);
+        prod_lo = v128_xor(prod_lo, u8x16_swizzle(t2_lo, data2));
+        prod_hi = v128_xor(prod_hi, u8x16_swizzle(t2_hi, data2));
+
+        let data3 = v128_and(u8x16_shr(value_hi, 4), clear_mask);
+        prod_lo = v128_xor(prod_lo, u8x16_swizzle(t3_lo, data3));
+        prod_hi = v128_xor(prod_hi, u8x16_swizzle(t3_hi, data3));
+
+        (prod_lo, prod_hi)
+    }
+
+    #[target_feature(enable = "simd128")]
+    unsafe fn muladd_128(
+        x_lo: v128,
+        x_hi: v128,
+        y_lo: v128,
+        y_hi: v128,
+        lut: &Multiply128lutT,
+    ) -> (v128, v128) {
+        let (prod_lo, prod_hi) = unsafe { Self::mul_128(y_lo, y_hi, lut) };
+        (v128_xor(x_lo, prod_lo), v128_xor(x_hi, prod_hi))
+    }
+
+    #[target_feature(enable = "simd128")]
+    unsafe fn mul_add(&self, x: &mut [[u8; 64]], y: &[[u8; 64]], log_m: GfElement) {
+        let lut = &self.mul128[log_m as usize];
+
+        for (x_chunk, y_chunk) in zip(x.iter_mut(), y.iter()) {
+            let x_ptr = x_chunk.as_mut_ptr().cast::<v128>();
+            let y_ptr = y_chunk.as_ptr().cast::<v128>();
+
+            let mut x0_lo = unsafe { v128_load(x_ptr) };
+            let mut x1_lo = unsafe { v128_load(x_ptr.add(1)) };
+            let mut x0_hi = unsafe { v128_load(x_ptr.add(2)) };
+            let mut x1_hi = unsafe { v128_load(x_ptr.add(3)) };
+
+            let y0_lo = unsafe { v128_load(y_ptr) };
+            let y1_lo = unsafe { v128_load(y_ptr.add(1)) };
+            let y0_hi = unsafe { v128_load(y_ptr.add(2)) };
+            let y1_hi = unsafe { v128_load(y_ptr.add(3)) };
+
+            (x0_lo, x0_hi) = unsafe { Self::muladd_128(x0_lo, x0_hi, y0_lo, y0_hi, lut) };
+            (x1_lo, x1_hi) = unsafe { Self::muladd_128(x1_lo, x1_hi, y1_lo, y1_hi, lut) };
+
+            unsafe {
+                v128_store(x_ptr, x0_lo);
+                v128_store(x_ptr.add(1), x1_lo);
+                v128_store(x_ptr.add(2), x0_hi);
+                v128_store(x_ptr.add(3), x1_hi);
+            }
+        }
+    }
+
+    #[target_feature(enable = "simd128")]
+    unsafe fn mul_wasm(&self, x: &mut [[u8; 64]], log_m: GfElement) {
+        let lut = &self.mul128[log_m as usize];
+
+        for chunk in x.iter_mut() {
+            let x_ptr = chunk.as_mut_ptr().cast::<v128>();
+
+            let x0_lo = unsafe { v128_load(x_ptr) };
+            let x1_lo = unsafe { v128_load(x_ptr.add(1)) };
+            let x0_hi = unsafe { v128_load(x_ptr.add(2)) };
+            let x1_hi = unsafe { v128_load(x_ptr.add(3)) };
+            let (prod0_lo, prod0_hi) = unsafe { Self::mul_128(x0_lo, x0_hi, lut) };
+            let (prod1_lo, prod1_hi) = unsafe { Self::mul_128(x1_lo, x1_hi, lut) };
+
+            unsafe {
+                v128_store(x_ptr, prod0_lo);
+                v128_store(x_ptr.add(1), prod1_lo);
+                v128_store(x_ptr.add(2), prod0_hi);
+                v128_store(x_ptr.add(3), prod1_hi);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn fft_butterfly_partial(&self, x: &mut [[u8; 64]], y: &mut [[u8; 64]], log_m: GfElement) {
+        unsafe {
+            self.mul_add(x, y, log_m);
+            self.xor_chunks(y, x);
+        }
+    }
+
+    #[inline(always)]
+    fn fft_butterfly_two_layers(
+        &self,
+        data: &mut ShardsRefMut,
+        pos: usize,
+        dist: usize,
+        log_m01: GfElement,
+        log_m23: GfElement,
+        log_m02: GfElement,
+    ) {
+        let (s0, s1, s2, s3) = data.dist4_mut(pos, dist);
+
+        if log_m02 == GF_MODULUS {
+            unsafe {
+                self.xor_chunks(s2, s0);
+                self.xor_chunks(s3, s1);
+            }
+        } else {
+            self.fft_butterfly_partial(s0, s2, log_m02);
+            self.fft_butterfly_partial(s1, s3, log_m02);
+        }
+
+        if log_m01 == GF_MODULUS {
+            unsafe { self.xor_chunks(s1, s0) };
+        } else {
+            self.fft_butterfly_partial(s0, s1, log_m01);
+        }
+
+        if log_m23 == GF_MODULUS {
+            unsafe { self.xor_chunks(s3, s2) };
+        } else {
+            self.fft_butterfly_partial(s2, s3, log_m23);
+        }
+    }
+
+    #[inline(always)]
+    fn fft_private(
+        &self,
+        data: &mut ShardsRefMut,
+        pos: usize,
+        size: usize,
+        truncated_size: usize,
+        skew_delta: usize,
+    ) {
+        let mut dist4 = size;
+        let mut dist = size >> 2;
+        while dist != 0 {
+            let mut r = 0;
+            while r < truncated_size {
+                let base = r + dist + skew_delta - 1;
+
+                let log_m01 = self.skew[base];
+                let log_m02 = self.skew[base + dist];
+                let log_m23 = self.skew[base + dist * 2];
+
+                for i in r..r + dist {
+                    self.fft_butterfly_two_layers(data, pos + i, dist, log_m01, log_m23, log_m02);
+                }
+
+                r += dist4;
+            }
+            dist4 = dist;
+            dist >>= 2;
+        }
+
+        if dist4 == 2 {
+            let mut r = 0;
+            while r < truncated_size {
+                let log_m = self.skew[r + skew_delta];
+                let (x, y) = data.dist2_mut(pos + r, 1);
+
+                if log_m == GF_MODULUS {
+                    unsafe { self.xor_chunks(y, x) };
+                } else {
+                    self.fft_butterfly_partial(x, y, log_m);
+                }
+
+                r += 2;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn ifft_butterfly_partial(&self, x: &mut [[u8; 64]], y: &mut [[u8; 64]], log_m: GfElement) {
+        unsafe {
+            self.xor_chunks(y, x);
+            self.mul_add(x, y, log_m);
+        }
+    }
+
+    #[inline(always)]
+    fn ifft_butterfly_two_layers(
+        &self,
+        data: &mut ShardsRefMut,
+        pos: usize,
+        dist: usize,
+        log_m01: GfElement,
+        log_m23: GfElement,
+        log_m02: GfElement,
+    ) {
+        let (s0, s1, s2, s3) = data.dist4_mut(pos, dist);
+
+        if log_m01 == GF_MODULUS {
+            unsafe { self.xor_chunks(s1, s0) };
+        } else {
+            self.ifft_butterfly_partial(s0, s1, log_m01);
+        }
+
+        if log_m23 == GF_MODULUS {
+            unsafe { self.xor_chunks(s3, s2) };
+        } else {
+            self.ifft_butterfly_partial(s2, s3, log_m23);
+        }
+
+        if log_m02 == GF_MODULUS {
+            unsafe {
+                self.xor_chunks(s2, s0);
+                self.xor_chunks(s3, s1);
+            }
+        } else {
+            self.ifft_butterfly_partial(s0, s2, log_m02);
+            self.ifft_butterfly_partial(s1, s3, log_m02);
+        }
+    }
+
+    #[inline(always)]
+    fn ifft_private(
+        &self,
+        data: &mut ShardsRefMut,
+        pos: usize,
+        size: usize,
+        truncated_size: usize,
+        skew_delta: usize,
+    ) {
+        let mut dist = 1;
+        let mut dist4 = 4;
+        while dist4 <= size {
+            let mut r = 0;
+            while r < truncated_size {
+                let base = r + dist + skew_delta - 1;
+
+                let log_m01 = self.skew[base];
+                let log_m02 = self.skew[base + dist];
+                let log_m23 = self.skew[base + dist * 2];
+
+                for i in r..r + dist {
+                    self.ifft_butterfly_two_layers(data, pos + i, dist, log_m01, log_m23, log_m02);
+                }
+
+                r += dist4;
+            }
+            dist = dist4;
+            dist4 <<= 2;
+        }
+
+        if dist < size {
+            let log_m = self.skew[dist + skew_delta - 1];
+            if log_m == GF_MODULUS {
+                rs_engine_utils::xor_within(data, pos + dist, pos, dist);
+            } else {
+                let (mut a, mut b) = data.split_at_mut(pos + dist);
+                for i in 0..dist {
+                    self.ifft_butterfly_partial(
+                        &mut a[pos + i],
+                        &mut b[i],
+                        log_m,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+impl Default for WasmSimdEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+impl ReedSolomonEngine for WasmSimdEngine {
+    fn fft(
+        &self,
+        data: &mut ShardsRefMut,
+        pos: usize,
+        size: usize,
+        truncated_size: usize,
+        skew_delta: usize,
+    ) {
+        self.fft_private(data, pos, size, truncated_size, skew_delta);
+    }
+
+    fn ifft(
+        &self,
+        data: &mut ShardsRefMut,
+        pos: usize,
+        size: usize,
+        truncated_size: usize,
+        skew_delta: usize,
+    ) {
+        self.ifft_private(data, pos, size, truncated_size, skew_delta);
+    }
+
+    fn mul(&self, x: &mut [[u8; 64]], log_m: GfElement) {
+        unsafe { self.mul_wasm(x, log_m) };
+    }
+
+    fn eval_poly(erasures: &mut [GfElement; GF_ORDER], truncated_size: usize) {
+        rs_engine_utils::eval_poly(erasures, truncated_size);
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+type CodecEngine = WasmSimdEngine;
+
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+type CodecEngine = DefaultEngine;
+
+type CodecEncoder = DefaultRateEncoder<CodecEngine>;
+type CodecDecoder = DefaultRateDecoder<CodecEngine>;
+
+fn codec_engine() -> CodecEngine {
+    CodecEngine::new()
+}
+
+fn new_codec_encoder(
+    original_count: usize,
+    recovery_count: usize,
+    shard_size: usize,
+) -> Result<CodecEncoder, RepairError> {
+    Ok(CodecEncoder::new(
+        original_count,
+        recovery_count,
+        shard_size,
+        codec_engine(),
+        None,
+    )?)
+}
+
+fn new_codec_decoder(
+    original_count: usize,
+    recovery_count: usize,
+    shard_size: usize,
+) -> Result<CodecDecoder, RepairError> {
+    Ok(CodecDecoder::new(
+        original_count,
+        recovery_count,
+        shard_size,
+        codec_engine(),
+        None,
+    )?)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -496,6 +935,66 @@ fn shard_slice_mut(bytes: &mut [u8], shard_size: usize, slot_index: usize) -> &m
     &mut bytes[start..start + shard_size]
 }
 
+fn shard_slice_range(
+    bytes: &[u8],
+    shard_size: usize,
+    slot_index: usize,
+    chunk_offset: usize,
+    chunk_end: usize,
+) -> &[u8] {
+    &shard_slice(bytes, shard_size, slot_index)[chunk_offset..chunk_end]
+}
+
+fn shard_slice_mut_range(
+    bytes: &mut [u8],
+    shard_size: usize,
+    slot_index: usize,
+    chunk_offset: usize,
+    chunk_end: usize,
+) -> &mut [u8] {
+    &mut shard_slice_mut(bytes, shard_size, slot_index)[chunk_offset..chunk_end]
+}
+
+fn validate_chunk_range(
+    shard_size: usize,
+    chunk_offset: usize,
+    chunk_length: usize,
+) -> Result<usize, RepairError> {
+    if chunk_offset % 64 != 0 || chunk_length == 0 || chunk_length % 2 != 0 {
+        return Err(RepairError::InvalidChunkRange {
+            chunk_offset,
+            chunk_length,
+            shard_size,
+        });
+    }
+
+    let Some(chunk_end) = chunk_offset.checked_add(chunk_length) else {
+        return Err(RepairError::InvalidChunkRange {
+            chunk_offset,
+            chunk_length,
+            shard_size,
+        });
+    };
+
+    if chunk_end > shard_size {
+        return Err(RepairError::InvalidChunkRange {
+            chunk_offset,
+            chunk_length,
+            shard_size,
+        });
+    }
+
+    if chunk_end < shard_size && chunk_length % 64 != 0 {
+        return Err(RepairError::InvalidChunkRange {
+            chunk_offset,
+            chunk_length,
+            shard_size,
+        });
+    }
+
+    Ok(chunk_end)
+}
+
 fn validate_missing_indices(
     missing_indices: &[u32],
     slot_count: usize,
@@ -521,6 +1020,8 @@ fn repair_in_place(
     missing_indices: &[u32],
     slot_count: usize,
     bytes: &mut [u8],
+    chunk_offset: usize,
+    chunk_length: usize,
 ) -> Result<usize, RepairError> {
     if original_count == 0 {
         return Err(RepairError::ZeroOriginalCount);
@@ -536,6 +1037,8 @@ fn repair_in_place(
             slot_count,
         });
     }
+
+    let chunk_end = validate_chunk_range(shard_size, chunk_offset, chunk_length)?;
 
     let recovery_count = slot_count - original_count;
     if !ReedSolomonEncoder::supports(original_count, recovery_count)
@@ -567,13 +1070,16 @@ fn repair_in_place(
         .collect();
 
     if !missing_original_indices.is_empty() {
-        let mut decoder = ReedSolomonDecoder::new(original_count, recovery_count, shard_size)?;
+        let mut decoder = new_codec_decoder(original_count, recovery_count, chunk_length)?;
 
         for slot_index in 0..original_count {
             if missing_set.contains(&slot_index) {
                 continue;
             }
-            decoder.add_original_shard(slot_index, shard_slice(bytes, shard_size, slot_index))?;
+            decoder.add_original_shard(
+                slot_index,
+                shard_slice_range(bytes, shard_size, slot_index, chunk_offset, chunk_end),
+            )?;
         }
 
         for recovery_index in 0..recovery_count {
@@ -583,7 +1089,7 @@ fn repair_in_place(
             }
             decoder.add_recovery_shard(
                 recovery_index,
-                shard_slice(bytes, shard_size, slot_index),
+                shard_slice_range(bytes, shard_size, slot_index, chunk_offset, chunk_end),
             )?;
         }
 
@@ -602,7 +1108,8 @@ fn repair_in_place(
         };
 
         for (index, shard) in restored_originals {
-            shard_slice_mut(bytes, shard_size, index).copy_from_slice(&shard);
+            shard_slice_mut_range(bytes, shard_size, index, chunk_offset, chunk_end)
+                .copy_from_slice(&shard);
         }
     }
 
@@ -614,10 +1121,16 @@ fn repair_in_place(
         .collect();
 
     if !missing_recovery_indices.is_empty() {
-        let mut encoder = ReedSolomonEncoder::new(original_count, recovery_count, shard_size)?;
+        let mut encoder = new_codec_encoder(original_count, recovery_count, chunk_length)?;
 
         for slot_index in 0..original_count {
-            encoder.add_original_shard(shard_slice(bytes, shard_size, slot_index))?;
+            encoder.add_original_shard(shard_slice_range(
+                bytes,
+                shard_size,
+                slot_index,
+                chunk_offset,
+                chunk_end,
+            ))?;
         }
 
         let regenerated_recovery = {
@@ -636,7 +1149,8 @@ fn repair_in_place(
 
         for (recovery_index, shard) in regenerated_recovery {
             let slot_index = original_count + recovery_index;
-            shard_slice_mut(bytes, shard_size, slot_index).copy_from_slice(&shard);
+            shard_slice_mut_range(bytes, shard_size, slot_index, chunk_offset, chunk_end)
+                .copy_from_slice(&shard);
         }
     }
 
@@ -648,6 +1162,8 @@ fn encode_in_place(
     shard_size: usize,
     slot_count: usize,
     bytes: &mut [u8],
+    chunk_offset: usize,
+    chunk_length: usize,
 ) -> Result<usize, RepairError> {
     if original_count == 0 {
         return Err(RepairError::ZeroOriginalCount);
@@ -664,6 +1180,8 @@ fn encode_in_place(
         });
     }
 
+    let chunk_end = validate_chunk_range(shard_size, chunk_offset, chunk_length)?;
+
     let recovery_count = slot_count - original_count;
     if !ReedSolomonEncoder::supports(original_count, recovery_count) {
         return Err(RepairError::UnsupportedShardCount {
@@ -672,10 +1190,16 @@ fn encode_in_place(
         });
     }
 
-    let mut encoder = ReedSolomonEncoder::new(original_count, recovery_count, shard_size)?;
+    let mut encoder = new_codec_encoder(original_count, recovery_count, chunk_length)?;
 
     for slot_index in 0..original_count {
-        encoder.add_original_shard(shard_slice(bytes, shard_size, slot_index))?;
+        encoder.add_original_shard(shard_slice_range(
+            bytes,
+            shard_size,
+            slot_index,
+            chunk_offset,
+            chunk_end,
+        ))?;
     }
 
     let generated_recovery = {
@@ -694,7 +1218,8 @@ fn encode_in_place(
 
     for (recovery_index, shard) in generated_recovery {
         let slot_index = original_count + recovery_index;
-        shard_slice_mut(bytes, shard_size, slot_index).copy_from_slice(&shard);
+        shard_slice_mut_range(bytes, shard_size, slot_index, chunk_offset, chunk_end)
+            .copy_from_slice(&shard);
     }
 
     Ok(recovery_count)
@@ -741,6 +1266,8 @@ pub fn leopard_repair(
     original_count: usize,
     shard_size: usize,
     missing_indices: &[u32],
+    chunk_offset: usize,
+    chunk_length: usize,
     shard_handle: AllocationHandle,
 ) -> Result<usize, RepairError> {
     with_registered_arena_mut(shard_handle, |meta, bytes| {
@@ -757,6 +1284,8 @@ pub fn leopard_repair(
             missing_indices,
             meta.slot_count,
             bytes,
+            chunk_offset,
+            chunk_length,
         )
     })
 }
@@ -768,6 +1297,8 @@ pub fn leopard_repair(
 pub fn leopard_encode(
     original_count: usize,
     shard_size: usize,
+    chunk_offset: usize,
+    chunk_length: usize,
     shard_handle: AllocationHandle,
 ) -> Result<usize, RepairError> {
     with_registered_arena_mut(shard_handle, |meta, bytes| {
@@ -778,7 +1309,14 @@ pub fn leopard_encode(
             });
         }
 
-        encode_in_place(original_count, shard_size, meta.slot_count, bytes)
+        encode_in_place(
+            original_count,
+            shard_size,
+            meta.slot_count,
+            bytes,
+            chunk_offset,
+            chunk_length,
+        )
     })
 }
 
@@ -831,6 +1369,8 @@ pub fn u32_buffer_ptr_js(handle: u64) -> Result<usize, JsValue> {
 pub fn leopard_repair_js(
     original_count: usize,
     shard_size: usize,
+    chunk_offset: usize,
+    chunk_length: usize,
     missing_indices_handle: u64,
     missing_indices_len: usize,
     shard_handle: u64,
@@ -843,6 +1383,8 @@ pub fn leopard_repair_js(
                 original_count,
                 shard_size,
                 missing_indices,
+                chunk_offset,
+                chunk_length,
                 AllocationHandle::from_raw(shard_handle),
             )
         },
@@ -855,9 +1397,17 @@ pub fn leopard_repair_js(
 pub fn leopard_encode_js(
     original_count: usize,
     shard_size: usize,
+    chunk_offset: usize,
+    chunk_length: usize,
     shard_handle: u64,
 ) -> Result<usize, JsValue> {
-    leopard_encode(original_count, shard_size, AllocationHandle::from_raw(shard_handle))
+    leopard_encode(
+        original_count,
+        shard_size,
+        chunk_offset,
+        chunk_length,
+        AllocationHandle::from_raw(shard_handle),
+    )
         .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
@@ -993,6 +1543,10 @@ mod tests {
     }
 
     fn run_encode_case(case: &EncodeCase) -> Vec<Vec<u8>> {
+        run_encode_case_in_chunks(case, case.shard_size)
+    }
+
+    fn run_encode_case_in_chunks(case: &EncodeCase, chunk_size: usize) -> Vec<Vec<u8>> {
         let slot_count = case.slot_count();
         let mut arena = OwnedShardArena::new(slot_count, case.shard_size);
 
@@ -1005,15 +1559,34 @@ mod tests {
             }
         }
 
-        let encoded_count =
-            leopard_encode(case.original_count, case.shard_size, arena.handle).expect("encoding should succeed");
+        let mut encoded_count = 0;
+        for chunk_offset in (0..case.shard_size).step_by(chunk_size) {
+            let chunk_length = (case.shard_size - chunk_offset).min(chunk_size);
+            encoded_count = leopard_encode(
+                case.original_count,
+                case.shard_size,
+                chunk_offset,
+                chunk_length,
+                arena.handle,
+            )
+            .expect("encoding should succeed");
+        }
 
         assert_eq!(encoded_count, case.recovery_count);
 
         read_slots(&mut arena, slot_count, case.shard_size)
     }
 
+    fn run_encode_case_bytes(case: &EncodeCase, chunk_size: usize) -> Vec<u8> {
+        let slots = run_encode_case_in_chunks(case, chunk_size);
+        slots.into_iter().flatten().collect()
+    }
+
     fn run_repair_case(case: &RepairCase) -> Vec<Vec<u8>> {
+        run_repair_case_in_chunks(case, case.shard_size)
+    }
+
+    fn run_repair_case_in_chunks(case: &RepairCase, chunk_size: usize) -> Vec<Vec<u8>> {
         let recovery_shards = encode_reference_recovery(&case.original_shards, case.recovery_count);
         let reference = reference_slots(&case.original_shards, &recovery_shards);
         let slot_count = case.original_count + case.recovery_count;
@@ -1040,17 +1613,39 @@ mod tests {
             }
         }
 
-        let repaired_count = leopard_repair(
-            case.original_count,
-            case.shard_size,
-            unsafe { std::slice::from_raw_parts(missing.ptr, missing.len) },
-            arena.handle,
-        )
-        .expect("repair should succeed");
+        let mut repaired_count = 0;
+        for chunk_offset in (0..case.shard_size).step_by(chunk_size) {
+            let chunk_length = (case.shard_size - chunk_offset).min(chunk_size);
+            repaired_count = leopard_repair(
+                case.original_count,
+                case.shard_size,
+                unsafe { std::slice::from_raw_parts(missing.ptr, missing.len) },
+                chunk_offset,
+                chunk_length,
+                arena.handle,
+            )
+            .expect("repair should succeed");
+        }
 
         assert_eq!(repaired_count, case.missing_indices.len());
 
         read_slots(&mut arena, slot_count, case.shard_size)
+    }
+
+    fn run_repair_case_bytes(case: &RepairCase, chunk_size: usize) -> Vec<u8> {
+        let slots = run_repair_case_in_chunks(case, chunk_size);
+        slots.into_iter().flatten().collect()
+    }
+
+    fn aligned_chunk_size(shard_size: usize, seed: usize) -> usize {
+        let full_chunks = shard_size / 64;
+        if full_chunks <= 1 {
+            return shard_size;
+        }
+
+        let chunk_chunks = 1 + (seed % full_chunks);
+        let chunk_size = chunk_chunks * 64;
+        chunk_size.min(shard_size)
     }
 
     #[test]
@@ -1103,7 +1698,7 @@ mod tests {
             }
         }
 
-        let encoded_count = leopard_encode(original_count, shard_size, arena.handle)
+        let encoded_count = leopard_encode(original_count, shard_size, 0, shard_size, arena.handle)
             .expect("encoding should succeed");
 
         assert_eq!(encoded_count, recovery_count);
@@ -1136,6 +1731,8 @@ mod tests {
             4,
             shard_size,
             unsafe { std::slice::from_raw_parts(missing.ptr, missing.len) },
+            0,
+            shard_size,
             arena.handle,
         )
         .expect_err("repair should fail when too many shards are missing");
@@ -1145,6 +1742,78 @@ mod tests {
             RepairError::NotEnoughAvailableShards {
                 original_count: 4,
                 available_count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn chunked_encode_matches_monolithic_output() {
+        let case = EncodeCase {
+            original_count: 4,
+            recovery_count: 3,
+            shard_size: 190,
+            original_shards: (0..4)
+                .map(|shard_index| {
+                    (0..190)
+                        .map(|byte_index| ((shard_index * 29 + byte_index * 11) % 251) as u8)
+                        .collect::<Vec<u8>>()
+                })
+                .collect(),
+        };
+
+        assert_eq!(run_encode_case_in_chunks(&case, 64), run_encode_case(&case));
+    }
+
+    #[test]
+    fn chunked_repair_matches_monolithic_output() {
+        let case = RepairCase {
+            original_count: 5,
+            recovery_count: 3,
+            shard_size: 198,
+            original_shards: (0..5)
+                .map(|shard_index| {
+                    (0..198)
+                        .map(|byte_index| ((shard_index * 23 + byte_index * 9) % 251) as u8)
+                        .collect::<Vec<u8>>()
+                })
+                .collect(),
+            missing_indices: vec![1, 6, 7],
+        };
+
+        assert_eq!(run_repair_case_in_chunks(&case, 64), run_repair_case(&case));
+    }
+
+    #[test]
+    fn rejects_chunk_ranges_that_split_internal_blocks() {
+        let original_count = 3;
+        let recovery_count = 2;
+        let shard_size = 198;
+        let mut arena = OwnedShardArena::new(original_count + recovery_count, shard_size);
+
+        write_slots(
+            &mut arena,
+            shard_size,
+            &reference_slots(
+                &(0..original_count)
+                    .map(|shard_index| {
+                        (0..shard_size)
+                            .map(|byte_index| ((shard_index * 13 + byte_index * 5) % 251) as u8)
+                            .collect::<Vec<u8>>()
+                    })
+                    .collect::<Vec<_>>(),
+                &vec![vec![0; shard_size]; recovery_count],
+            ),
+        );
+
+        let error = leopard_encode(original_count, shard_size, 64, 18, arena.handle)
+            .expect_err("mid-shard tail chunks should be rejected");
+
+        assert_eq!(
+            error,
+            RepairError::InvalidChunkRange {
+                chunk_offset: 64,
+                chunk_length: 18,
+                shard_size,
             }
         );
     }
@@ -1281,8 +1950,15 @@ mod tests {
 
             write_slots(&mut arena, case.shard_size, &reference);
 
-            let repaired_count = leopard_repair(case.original_count, case.shard_size, &[], arena.handle)
-                .expect("repair without missing indices should succeed");
+            let repaired_count = leopard_repair(
+                case.original_count,
+                case.shard_size,
+                &[],
+                0,
+                case.shard_size,
+                arena.handle,
+            )
+            .expect("repair without missing indices should succeed");
 
             prop_assert_eq!(repaired_count, 0);
             prop_assert_eq!(read_slots(&mut arena, case.slot_count(), case.shard_size), reference);
@@ -1302,6 +1978,8 @@ mod tests {
                 case.original_count,
                 case.shard_size,
                 unsafe { std::slice::from_raw_parts(missing.ptr, missing.len) },
+                0,
+                case.shard_size,
                 arena.handle,
             )
             .expect_err("duplicate missing indices should fail");
@@ -1322,6 +2000,8 @@ mod tests {
                 case.original_count,
                 case.shard_size,
                 unsafe { std::slice::from_raw_parts(missing.ptr, missing.len) },
+                0,
+                case.shard_size,
                 arena.handle,
             )
             .expect_err("out-of-range missing indices should fail");
@@ -1333,6 +2013,30 @@ mod tests {
                     slot_count: case.slot_count(),
                 }
             );
+        }
+
+        #[test]
+        fn pbt_chunked_encode_matches_monolithic_bytes(
+            case in encode_case_strategy(),
+            chunk_seed in 0_usize..64,
+        ) {
+            let chunk_size = aligned_chunk_size(case.shard_size, chunk_seed);
+            let monolithic = run_encode_case_bytes(&case, case.shard_size);
+            let chunked = run_encode_case_bytes(&case, chunk_size);
+
+            prop_assert_eq!(chunked, monolithic);
+        }
+
+        #[test]
+        fn pbt_chunked_repair_matches_monolithic_bytes(
+            case in repair_case_strategy(),
+            chunk_seed in 0_usize..64,
+        ) {
+            let chunk_size = aligned_chunk_size(case.shard_size, chunk_seed);
+            let monolithic = run_repair_case_bytes(&case, case.shard_size);
+            let chunked = run_repair_case_bytes(&case, chunk_size);
+
+            prop_assert_eq!(chunked, monolithic);
         }
     }
 }

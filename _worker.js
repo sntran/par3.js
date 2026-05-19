@@ -330,7 +330,7 @@ async function processRepairPipeline(
     });
 
     if (missingIndices.length !== 0) {
-      codec.repair();
+      await codec.repair();
     }
 
     await writeMultipartResponse(writer, responseBoundary, codec, missingIndices);

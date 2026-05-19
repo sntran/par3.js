@@ -23,9 +23,9 @@ This repository is intentionally set up for small, validated changes.
 - Shared shard repair state lives in `lib/mod.js` via the `Par3` class. Prefer changing that
   shared layer before duplicating behavior in `_worker.js` or `bin/main.js`.
 - The CLI implementation and executable entrypoint both live in `bin/main.js`.
-- `reed-solomon-simd` 3.1.0 has optimized SSSE3/AVX2/Neon engines but no wasm SIMD backend; the
-  wasm build currently runs the scalar engine even though `scripts/build-wasm.sh` keeps
-  `-C target-feature=+simd128` enabled for future compatibility.
+- The wasm build now includes a repository-local `wasm32-simd128` engine layered through
+  `reed-solomon-simd`'s rate API; preserve the existing chunk alignment rules when changing the
+  shared JS runtime or Rust chunked bindings.
 
 ## Preferred validation order
 

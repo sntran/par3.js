@@ -351,7 +351,7 @@ async function buildRecoveryShards(originalShards, recoveryCount) {
       bytes.set(originalShards[index], index * shardSize);
     }
 
-    leopard_encode(originalCount, shardSize, arenaHandle);
+    leopard_encode(originalCount, shardSize, 0, shardSize, arenaHandle);
 
     const encodedBytes = new Uint8Array(memory.buffer, arenaPtr, slotCount * shardSize);
 
@@ -1331,8 +1331,8 @@ test("keeps wasm-backed response bytes alive until a slow consumer finishes read
   const repairDone = Promise.withResolvers();
   let freeCalls = 0;
 
-  t.mock.method(Par3.prototype, "repair", function mockRepair(...args) {
-    const result = originalRepair.apply(this, args);
+  t.mock.method(Par3.prototype, "repair", async function mockRepair(...args) {
+    const result = await originalRepair.apply(this, args);
     repairDone.resolve();
     return result;
   });

@@ -60,11 +60,15 @@ npm run build
 This runs `scripts/build-wasm.sh`, which ensures the `wasm32-unknown-unknown` target is present and
 builds the package into `pkg/` with `simd128` enabled.
 
-The `-C target-feature=+simd128` flag is currently future-proofing rather than an active fast path
-for this dependency stack. `reed-solomon-simd` 3.1.0 documents optimized engines for SSSE3, AVX2,
-and NEON, but no WebAssembly SIMD backend, so the wasm build currently falls back to the scalar
-engine. The crate's public `rate::Engine` extension point is a plausible hook for a future
-`wasm32-simd128` backend, but this repository does not yet ship that custom engine.
+## Performance
+
+The wasm build now ships a repository-local `wasm32-simd128` engine that plugs into the
+`reed-solomon-simd` rate API instead of falling back to the scalar path.
+
+The shared JavaScript runtime also processes repair and recovery work asynchronously in aligned
+chunks, yielding back to the event loop between chunks with `setTimeout(0)`. That keeps the Worker
+response path streaming under heavy repair load instead of monopolizing the main thread until a
+full-shard encode or repair completes.
 
 ## Test
 
