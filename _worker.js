@@ -1,7 +1,9 @@
 /**
- * Cloudflare Worker entrypoint for streamed PAR-style repair.
+ * Cloudflare Worker entrypoint for streamed PAR-style encode and repair.
  *
  * Request contract:
+ * - `POST /` ingests original shards and streams generated recovery shards back.
+ * - `PATCH /` ingests present shards and streams repaired outputs back.
  * - layout arrives on the request URL query string:
  *   - `n` or `original_count`
  *   - `r` or `recovery_count`
@@ -35,9 +37,10 @@ const SHARD_PART_NAME = /^shard_(\d+)$/u;
 const wasmReady = Promise.resolve();
 
 class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, headers = {}) {
     super(message);
     this.name = "HttpError";
+    this.headers = headers;
     this.status = status;
   }
 }
@@ -46,8 +49,8 @@ function badRequest(message) {
   return new HttpError(400, message);
 }
 
-function resolveLockedLayout(request) {
-  const layout = Par3.resolveLayoutFromSearchParams(new URL(request.url).searchParams, {
+function resolveLockedLayout(searchParams) {
+  const layout = Par3.resolveLayoutFromSearchParams(searchParams, {
     createError: badRequest,
   });
 
@@ -58,11 +61,34 @@ function resolveLockedLayout(request) {
   return layout;
 }
 
+function resolveOperation(request) {
+  const requestUrl = new URL(request.url);
+
+  if (requestUrl.pathname !== "/") {
+    throw new HttpError(404, `unsupported path ${requestUrl.pathname}`);
+  }
+
+  if (request.method === "POST") {
+    return "encode";
+  }
+
+  if (request.method === "PATCH") {
+    return "repair";
+  }
+
+  throw new HttpError(405, `unsupported method ${request.method}`, {
+    allow: "POST, PATCH",
+  });
+}
+
 function errorResponse(error) {
   if (error instanceof HttpError) {
     return new Response(JSON.stringify({ error: error.message }), {
       status: error.status,
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...error.headers,
+      },
     });
   }
 
@@ -169,7 +195,7 @@ async function readPartBytes(part, expectedByteLength, overflowStatus, overflowM
   let written = 0;
 
   for await (const chunk of part.body) {
-    const chunkBytes = toUint8Array(chunk);
+    const chunkBytes = Uint8Array.from(toUint8Array(chunk));
     if (written + chunkBytes.byteLength > expectedByteLength) {
       throw new HttpError(overflowStatus, overflowMessage);
     }
@@ -191,11 +217,10 @@ async function writeShardPart(codec, part, slotIndex, slotDigests) {
     throw new HttpError(409, `duplicate shard part received for slot ${slotIndex}`);
   }
 
-  const target = codec.prepareWritableShard(slotIndex);
   let written = 0;
 
   for await (const chunk of part.body) {
-    const chunkBytes = toUint8Array(chunk);
+    const chunkBytes = Uint8Array.from(toUint8Array(chunk));
     if (written + chunkBytes.byteLength > codec.shardSize) {
       throw new HttpError(
         400,
@@ -203,7 +228,7 @@ async function writeShardPart(codec, part, slotIndex, slotDigests) {
       );
     }
 
-    target.set(chunkBytes, written);
+    codec.prepareWritableShard(slotIndex).set(chunkBytes, written);
     written += chunkBytes.byteLength;
   }
 
@@ -214,7 +239,7 @@ async function writeShardPart(codec, part, slotIndex, slotDigests) {
     );
   }
 
-  await verifyShardDigest(slotIndex, target, slotDigests);
+  await verifyShardDigest(slotIndex, codec.shardView(slotIndex), slotDigests);
   codec.commitShard(slotIndex);
 }
 
@@ -234,7 +259,15 @@ function resolveShardIndex(partName) {
   );
 }
 
-async function ingestMultipartRequest({ request, requestBoundary, codec, requestedMissingIndices }) {
+async function ingestMultipartRequest({
+  request,
+  requestBoundary,
+  codec,
+  digestSlotCount = codec.slotCount,
+  thresholdReached = (candidateCodec) => candidateCodec.thresholdReached(),
+  thresholdMessage = null,
+  validateShardIndex = () => {},
+}) {
   const decodedStream = request.body.pipeThrough(MultipartDecoder.create({ boundary: requestBoundary }));
   let sawDigestsPart = false;
   let sawShardPart = false;
@@ -258,19 +291,21 @@ async function ingestMultipartRequest({ request, requestBoundary, codec, request
         slotDigests = parseDigestBlob(
           await readPartBytes(
             part,
-            codec.slotCount * DIGEST_BYTE_LENGTH,
+            digestSlotCount * DIGEST_BYTE_LENGTH,
             413,
-            `digests exceeds expected size of ${codec.slotCount * DIGEST_BYTE_LENGTH} bytes`,
-            `digests must contain exactly ${codec.slotCount} contiguous 32-byte hashes`,
+            `digests exceeds expected size of ${digestSlotCount * DIGEST_BYTE_LENGTH} bytes`,
+            `digests must contain exactly ${digestSlotCount} contiguous 32-byte hashes`,
           ),
-          codec.slotCount,
+          digestSlotCount,
         );
       } else {
         sawShardPart = true;
-        await writeShardPart(codec, part, resolveShardIndex(partName), slotDigests);
+        const slotIndex = resolveShardIndex(partName);
+        validateShardIndex(slotIndex, partName);
+        await writeShardPart(codec, part, slotIndex, slotDigests);
       }
 
-      if (codec.thresholdReached()) {
+      if (thresholdReached(codec)) {
         shouldCancel = true;
         break;
       }
@@ -283,19 +318,20 @@ async function ingestMultipartRequest({ request, requestBoundary, codec, request
     void decodedStream.cancel("repair threshold reached");
   }
 
-  if (!codec.thresholdReached()) {
+  if (!thresholdReached(codec)) {
     throw new HttpError(
       422,
-      `repair threshold not reached: received ${codec.receivedIndices.size} shards but require ${codec.originalCount}`,
+      thresholdMessage
+        ? thresholdMessage(codec)
+        : `repair threshold not reached: received ${codec.receivedIndices.size} shards but require ${codec.originalCount}`,
     );
   }
-
-  return responseMissingIndices(codec, requestedMissingIndices);
 }
 
 async function writeMultipartResponse(writer, responseBoundary, codec, missingIndices) {
   for (const index of missingIndices) {
     await writer.write(encodeBoundary(responseBoundary));
+    const shardBytes = Uint8Array.from(codec.shardView(index));
 
     const partHeaders = {
       "Content-Disposition": `form-data; name="shard_${index}"; filename="shard_${index}.bin"`,
@@ -303,12 +339,43 @@ async function writeMultipartResponse(writer, responseBoundary, codec, missingIn
       "X-Shard-Index": String(index),
     };
 
-    for await (const chunk of encodePart(partHeaders, codec.shardView(index))) {
+    for await (const chunk of encodePart(partHeaders, shardBytes)) {
       await writer.write(chunk);
     }
   }
 
   await writer.write(encodeClosingBoundary(responseBoundary));
+}
+
+async function processMultipartPipeline({
+  request,
+  requestBoundary,
+  responseBoundary,
+  codec,
+  writable,
+  ingestOptions,
+  execute,
+}) {
+  const writer = writable.getWriter();
+
+  try {
+    await ingestMultipartRequest({
+      request,
+      requestBoundary,
+      codec,
+      ...ingestOptions,
+    });
+
+    const outputIndices = await execute(codec);
+
+    await writeMultipartResponse(writer, responseBoundary, codec, outputIndices);
+    await writer.close();
+  } catch (error) {
+    await writer.abort(error).catch(() => undefined);
+    throw error;
+  } finally {
+    writer.releaseLock();
+  }
 }
 
 async function processRepairPipeline(
@@ -319,44 +386,69 @@ async function processRepairPipeline(
   codec,
   writable,
 ) {
-  const writer = writable.getWriter();
+  return processMultipartPipeline({
+    request,
+    requestBoundary,
+    responseBoundary,
+    codec,
+    writable,
+    ingestOptions: {},
+    execute: async (candidateCodec) => {
+      const missingIndices = responseMissingIndices(candidateCodec, layout.requestedMissingIndices);
 
-  try {
-    const missingIndices = await ingestMultipartRequest({
-      request,
-      requestBoundary,
-      codec,
-      requestedMissingIndices: layout.requestedMissingIndices,
-    });
+      if (missingIndices.length !== 0) {
+        await candidateCodec.repair();
+      }
 
-    if (missingIndices.length !== 0) {
-      await codec.repair();
-    }
+      return missingIndices;
+    },
+  });
+}
 
-    await writeMultipartResponse(writer, responseBoundary, codec, missingIndices);
-    await writer.close();
-  } catch (error) {
-    await writer.abort(error).catch(() => undefined);
-    throw error;
-  } finally {
-    writer.releaseLock();
-  }
+async function processEncodePipeline(
+  request,
+  requestBoundary,
+  responseBoundary,
+  codec,
+  writable,
+) {
+  return processMultipartPipeline({
+    request,
+    requestBoundary,
+    responseBoundary,
+    codec,
+    writable,
+    ingestOptions: {
+      digestSlotCount: codec.originalCount,
+      thresholdMessage: (candidateCodec) =>
+        `encode threshold not reached: received ${candidateCodec.receivedIndices.size} original shards but require ${candidateCodec.originalCount}`,
+      validateShardIndex: (slotIndex) => {
+        if (slotIndex >= codec.originalCount) {
+          throw badRequest(
+            `encode only accepts original shard parts below original_count ${codec.originalCount}`,
+          );
+        }
+      },
+    },
+    execute: (candidateCodec) => candidateCodec.encode(),
+  });
 }
 
 export default {
   async fetch(request, env, ctx) {
     void env;
 
-    if (request.method !== "POST") {
-      return new Response(null, {
-        status: 405,
-        headers: { allow: "POST" },
-      });
+    let operation;
+    try {
+      operation = resolveOperation(request);
+    } catch (error) {
+      return errorResponse(error);
     }
 
+    const requestUrl = new URL(request.url);
     let layout;
     try {
-      layout = resolveLockedLayout(request);
+      layout = resolveLockedLayout(requestUrl.searchParams);
     } catch (error) {
       return errorResponse(error);
     }
@@ -387,19 +479,27 @@ export default {
           "content-type": `multipart/form-data; boundary=${responseBoundary}`,
         },
       });
-      const backgroundPromise = processRepairPipeline(
-        request,
-        requestBoundary,
-        responseBoundary,
-        layout,
-        codec,
-        writable,
-      );
+      const operationPromise = operation === "encode"
+        ? processEncodePipeline(
+          request,
+          requestBoundary,
+          responseBoundary,
+          codec,
+          writable,
+        )
+        : processRepairPipeline(
+          request,
+          requestBoundary,
+          responseBoundary,
+          layout,
+          codec,
+          writable,
+        );
 
       if (typeof ctx?.waitUntil === "function") {
-        ctx.waitUntil(backgroundPromise);
+        ctx.waitUntil(operationPromise);
       } else {
-        void backgroundPromise.catch(() => undefined);
+        void operationPromise.catch(() => undefined);
       }
 
       return response;

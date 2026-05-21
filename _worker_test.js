@@ -165,8 +165,8 @@ function createLayoutSearchParams(layout = {}) {
   return searchParams;
 }
 
-function createWorkerUrl(layoutOrSearchParams = {}) {
-  const url = new URL("https://example.com/repair");
+function createWorkerUrl(layoutOrSearchParams = {}, pathname = "/") {
+  const url = new URL(`https://example.com${pathname}`);
   const searchParams = layoutOrSearchParams instanceof URLSearchParams
     ? layoutOrSearchParams
     : createLayoutSearchParams(layoutOrSearchParams);
@@ -424,14 +424,18 @@ async function assertMultipartStreamFailure(response, pattern) {
   await assert.rejects(() => readStream(response.body), pattern);
 }
 
-async function invokeMultipart(parts, seed, { searchParams = defaultWorkerSearchParams() } = {}) {
+async function invokeMultipart(
+  parts,
+  seed,
+  { method = "PATCH", searchParams = defaultWorkerSearchParams(), pathname = "/" } = {},
+) {
   const boundary = `----par3-${seed}`;
   const rng = createRng(seed ^ 0xa5a5a5a5);
   const requestBody = createStreamingMultipart(parts, boundary, rng);
 
   return worker.fetch(
-    new Request(createWorkerUrl(searchParams), {
-      method: "POST",
+    new Request(createWorkerUrl(searchParams, pathname), {
+      method,
       headers: {
         "content-type": `multipart/form-data; boundary=${boundary}`,
       },
@@ -446,11 +450,13 @@ async function invokeMultipart(parts, seed, { searchParams = defaultWorkerSearch
 async function invokeRawRequest({
   body,
   contentType,
+  method = "PATCH",
   searchParams = defaultWorkerSearchParams(),
+  pathname = "/",
 }) {
   return worker.fetch(
-    new Request(createWorkerUrl(searchParams), {
-      method: "POST",
+    new Request(createWorkerUrl(searchParams, pathname), {
+      method,
       headers: contentType ? { "content-type": contentType } : {},
       body,
       duplex: "half",
@@ -491,9 +497,11 @@ function encodeMultipartBytes(parts, boundary, { trailingCrlf = true } = {}) {
   return bytes;
 }
 
-async function invokeWorker(parts, metadata, seed) {
+async function invokeWorker(parts, metadata, seed, { method = "PATCH", pathname = "/" } = {}) {
   return invokeMultipart(buildWorkerParts(parts, metadata), seed, {
+    method,
     searchParams: createLayoutSearchParams(metadata),
+    pathname,
   });
 }
 
@@ -599,6 +607,115 @@ test("streams an empty multipart response when requested outputs are already pre
 
   assert.equal(response.status, 200);
   assert.deepEqual(await collectResponseParts(response), []);
+});
+
+test("encodes recovery shards on POST /", async () => {
+  const originalShards = [
+    Uint8Array.from([0, 1, 2, 3]),
+    Uint8Array.from([4, 5, 6, 7]),
+    Uint8Array.from([8, 9, 10, 11]),
+  ];
+  const expectedRecoveryShards = await buildRecoveryShards(originalShards, 2);
+  const response = await invokeWorker(
+    [
+      buildPart("shard_0", originalShards[0]),
+      buildPart("shard_1", originalShards[1]),
+      buildPart("shard_2", originalShards[2]),
+    ],
+    {
+      original_count: 3,
+      recovery_count: 2,
+      shard_size: 4,
+    },
+    121,
+    { method: "POST" },
+  );
+
+  assert.equal(response.status, 200);
+  const encodedParts = await collectResponseParts(response);
+  assert.deepEqual(encodedParts.map((part) => part.name), ["shard_3", "shard_4"]);
+  assert.deepEqual(encodedParts[0].bytes, expectedRecoveryShards[0]);
+  assert.deepEqual(encodedParts[1].bytes, expectedRecoveryShards[1]);
+});
+
+test("repairs missing shards on PATCH /", async () => {
+  const originalShards = [
+    Uint8Array.from([0, 1, 2, 3]),
+    Uint8Array.from([4, 5, 6, 7]),
+  ];
+  const recoveryShards = await buildRecoveryShards(originalShards, 1);
+  const response = await invokeWorker(
+    [
+      buildPart("shard_0", originalShards[0]),
+      buildPart("shard_2", recoveryShards[0]),
+    ],
+    {
+      original_count: 2,
+      recovery_count: 1,
+      shard_size: 4,
+      missing_indices: [1],
+    },
+    122,
+    { method: "PATCH" },
+  );
+
+  assert.equal(response.status, 200);
+  const repairedParts = await collectResponseParts(response);
+  assert.deepEqual(repairedParts.map((part) => part.name), ["shard_1"]);
+  assert.deepEqual(repairedParts[0].bytes, originalShards[1]);
+});
+
+test("returns 404 for deprecated path-based routes", async () => {
+  const response = await invokeMultipart(
+    [buildPart("shard_0", Uint8Array.from([0, 1, 2, 3]))],
+    123,
+    { method: "PATCH", pathname: "/repair" },
+  );
+
+  assert.equal(response.status, 404);
+  assert.match((await response.json()).error, /unsupported path \/repair/);
+});
+
+test("encode rejects recovery-slot shard inputs", async () => {
+  const response = await invokeWorker(
+    [
+      buildPart("shard_0", Uint8Array.from([0, 1, 2, 3])),
+      buildPart("shard_2", Uint8Array.from([4, 5, 6, 7])),
+    ],
+    {
+      original_count: 2,
+      recovery_count: 1,
+      shard_size: 4,
+    },
+    125,
+    { method: "POST" },
+  );
+
+  await assertMultipartStreamFailure(
+    response,
+    /encode only accepts original shard parts below original_count 2/,
+  );
+});
+
+test("encode fails when too few original shards are provided", async () => {
+  const response = await invokeWorker(
+    [
+      buildPart("shard_0", Uint8Array.from([0, 1, 2, 3])),
+      buildPart("shard_1", Uint8Array.from([4, 5, 6, 7])),
+    ],
+    {
+      original_count: 3,
+      recovery_count: 1,
+      shard_size: 4,
+    },
+    126,
+    { method: "POST" },
+  );
+
+  await assertMultipartStreamFailure(
+    response,
+    /encode threshold not reached: received 2 original shards but require 3/,
+  );
 });
 
 test("returns 400 when required query parameters are missing", async () => {
@@ -1358,7 +1475,7 @@ test("keeps wasm-backed response bytes alive until a slow consumer finishes read
       shard_size: 4,
       missing_indices: [1],
     }), {
-      method: "POST",
+      method: "PATCH",
       headers: {
         "content-type": "multipart/form-data; boundary=----par3-slow-consumer",
       },
@@ -1506,7 +1623,7 @@ test("accepts decoder body chunks that are views, ArrayBuffers, and array-like v
       shard_size: 4,
       missing_indices: [1],
     }), {
-      method: "POST",
+      method: "PATCH",
       headers: {
         "content-type": "multipart/form-data; boundary=mocked",
       },
@@ -1675,7 +1792,7 @@ test("returns before request ingress is fully consumed once the repair threshold
       shard_size: 4,
       missing_indices: [1],
     }), {
-      method: "POST",
+      method: "PATCH",
       headers: {
         "content-type": `multipart/form-data; boundary=${boundary}`,
       },
@@ -1784,7 +1901,7 @@ test("waitUntil also tracks rejected background pumps", async () => {
 
 test("returns 405 for unsupported methods", async () => {
   const response = await worker.fetch(
-    new Request("https://example.com/repair", {
+    new Request("https://example.com/", {
       method: "GET",
     }),
     {},
@@ -1792,5 +1909,5 @@ test("returns 405 for unsupported methods", async () => {
   );
 
   assert.equal(response.status, 405);
-  assert.equal(response.headers.get("allow"), "POST");
+  assert.equal(response.headers.get("allow"), "POST, PATCH");
 });

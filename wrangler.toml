@@ -15,8 +15,9 @@ cpu_ms = 300000
 
 [build]
 command = "npm run build:wasm"
-watch_dir = ["src", "scripts", "Cargo.toml", "_worker.js", "tests"]
+watch_dir = "src"
 
 [[rules]]
 type = "CompiledWasm"
 globs = ["pkg/*.wasm"]
+fallthrough = true

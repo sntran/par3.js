@@ -3,8 +3,8 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const trackedFiles = ["_worker.js", "bin/main.js", "lib/mod.js", "lib/multipart.js"];
-const testFiles = ["_worker_test.js", "bin/main_test.js", "lib/mod_test.js", "lib/multipart_test.js"];
+const trackedFiles = ["_worker.js", "bin/main.js", "lib/envelope.js", "lib/mod.js", "lib/multipart.js"];
+const testFiles = ["_worker_test.js", "bin/main_test.js", "examples/fetch_encode_repair_gzip_test.js", "lib/envelope_test.js", "lib/mod_test.js", "lib/multipart_test.js"];
 
 function stripAnsi(value) {
   return value.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "");
@@ -108,4 +108,4 @@ if (failures.length > 0) {
   process.exit(1);
 }
 
-console.log("Coverage thresholds met for _worker.js, bin/main.js, lib/mod.js, and lib/multipart.js.");
+console.log("Coverage thresholds met for _worker.js, bin/main.js, lib/envelope.js, lib/mod.js, and lib/multipart.js.");

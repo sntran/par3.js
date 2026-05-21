@@ -1,8 +1,9 @@
 # par3
 
 `par3` is a streaming PAR3-style erasure coding service and local repair tool. It combines a Rust
-`reed-solomon-simd` core, a Cloudflare Worker that processes multipart uploads over Web Streams,
-and a Node.js CLI for repairing shard sets from disk.
+`reed-solomon-simd` core, a Cloudflare Worker that processes streamed multipart encode and repair
+requests over Web Streams, and a Node.js CLI that can operate on either raw shard sets or
+packetized PAR2-style envelopes.
 
 The repository targets Node.js 26.1+ for local development while keeping Worker-facing code inside
 Cloudflare's `nodejs_compat` compatibility layer.
@@ -19,22 +20,29 @@ The repository has five main layers:
 3. `lib/mod.js`
   The shared `Par3` class owns shard-layout validation, arena growth, in-place repair, and shard
   extraction for both runtime entrypoints.
-4. `_worker.js`
-  The Worker reads layout metadata from URL search params, returns a streaming response
-  immediately, ingests binary shard parts directly into wasm memory in the background, and aborts
-  the response stream if a late ingress or repair error occurs under Cloudflare's `nodejs_compat`
-  layer.
-5. `bin/main.js`
-  The local CLI exposes `create` and `repair` subcommands that read shard files from disk and
-  write recovery or repaired output shards into an output directory.
+  4. `lib/envelope.js`
+    Node-side PAR2/PAR3 packet framing used by the CLI porcelain layer. It keeps file metadata,
+    packet checksums, and recovery-block parsing out of the shared shard runtime.
+  5. `_worker.js`
+    The Worker reads layout metadata from URL search params, routes `POST /` for encode and
+    `PATCH /` for repair through the same multipart ingress/egress pipeline, returns a streaming
+    response immediately,
+    and aborts the response stream if a late ingress or codec error occurs under Cloudflare's
+    `nodejs_compat` layer.
+  6. `bin/main.js`
+    The local CLI exposes `create` and `repair` subcommands in two layers: a porcelain mode for
+    packetized file sets and a raw-shard mode for direct slot-level workflows.
 
 ## Features
 
 - Streaming multipart request handling in the Worker
+- Verb-routed Worker encode and repair on `/`
 - Generic RFC 7578 multipart parsing and encoding in `lib/multipart.js`
+- Strict PAR2/PAR3 packet framing in `lib/envelope.js`
 - In-place encode and repair over wasm linear memory
 - Shared `Par3` runtime used by both the Worker and the CLI
-- Built-in `create` and `repair` subcommands with `par3cmdline`-style `-n`, `-r`, and `-s` flags
+- Built-in porcelain `create`/`repair` flows plus raw shard subcommands with `par3cmdline`-style
+  `-n`, `-r`, and `-s` flags
 - Deterministic property-style tests in Rust and Node.js
 - Built-in Node.js CLI with no third-party runtime dependencies for argument parsing
 - Enforced 100% line, branch, and function coverage for maintained JS entrypoints
@@ -91,12 +99,17 @@ npm run test:coverage
 ```
 
 This command uses Node's built-in test coverage output plus a repository-local coverage gate to
-enforce 100% line, branch, and function coverage for `_worker.js`, `bin/main.js`, `lib/mod.js`,
-and `lib/multipart.js`.
+enforce 100% line, branch, and function coverage for `_worker.js`, `bin/main.js`,
+`lib/envelope.js`, `lib/mod.js`, and `lib/multipart.js`.
 
 ## Worker request contract
 
-The Worker expects layout metadata on the request URL and a strictly binary `multipart/form-data`
+The Worker exposes the same binary multipart contract on the root path with method-based routing:
+
+- `POST /`: ingest original shards and stream generated recovery shards back.
+- `PATCH /`: ingest present shards and stream repaired requested outputs back.
+
+Both methods expect layout metadata on the request URL and a strictly binary `multipart/form-data`
 body.
 
 Query parameters:
@@ -104,7 +117,7 @@ Query parameters:
 - `n` or `original_count`: number of original data shards
 - `r` or `recovery_count`: number of recovery shards
 - `s` or `shard_size`: shard size in bytes, must be even
-- repeated `i` or `missing_indices`: shard indexes the caller wants returned
+- repeated `i` or `missing_indices`: shard indexes the caller wants returned from `PATCH /`
 - `total_shard_count`: optional explicit slot count when `recovery_count` is not supplied
 
 The Worker body may contain only:
@@ -125,14 +138,24 @@ Resource caps enforced before any wasm allocation:
 - `shard_size <= 10485760` (10 MiB)
 - `total_shard_count * shard_size <= 134217728` (128 MiB)
 
-Example `curl` request:
+Example repair request:
 
 ```bash
-curl -X POST 'https://<your-worker>/repair?n=4&r=2&s=65536&i=1' \
+curl -X PATCH 'https://<your-worker>/?n=4&r=2&s=65536&i=1' \
   -F 'shard_0=@./shards/shard_0.bin;type=application/octet-stream' \
   -F 'shard_2=@./shards/shard_2.bin;type=application/octet-stream' \
   -F 'shard_3=@./shards/shard_3.bin;type=application/octet-stream' \
   -F 'shard_4=@./shards/shard_4.bin;type=application/octet-stream'
+```
+
+Example encode request:
+
+```bash
+curl -X POST 'https://<your-worker>/?n=4&r=2&s=65536' \
+  -F 'shard_0=@./shards/shard_0.bin;type=application/octet-stream' \
+  -F 'shard_1=@./shards/shard_1.bin;type=application/octet-stream' \
+  -F 'shard_2=@./shards/shard_2.bin;type=application/octet-stream' \
+  -F 'shard_3=@./shards/shard_3.bin;type=application/octet-stream'
 ```
 
 Important runtime rule:
@@ -166,10 +189,36 @@ The command naming intentionally matches `par3cmdline` where the workflows overl
 - `par3 c(reate) ...`
 - `par3 r(epair) ...`
 
-This project does not implement the full `.par3` volume-file workflow from `par3cmdline`; its CLI
-repairs raw shard layouts directly.
+The CLI now has two surfaces:
+
+- Porcelain mode: `create` packs input files into a PAR2-style manifest plus recovery volumes,
+  and `repair` reads those envelopes back to restore missing or corrupt files.
+- Raw-shard mode: the original `-n` / `-r` / `-s` interface still reads and writes slot files
+  directly.
+
+The packet layer is intentionally lean. It uses standard PAR2 packet framing and checksums, but it
+still wraps the repository's native shard codec rather than a full legacy PAR2 matrix
+implementation.
 
 ### Usage
+
+```bash
+node ./bin/main.js create \
+  -r 2 \
+  -s 65536 \
+  --set-name archive \
+  --output-dir ./parity \
+  ./archive.bin ./photo.jpg
+```
+
+```bash
+node ./bin/main.js repair \
+  ./parity/archive.par2 \
+  --input-dir ./downloads \
+  --output-dir ./repaired
+```
+
+### Raw shard mode
 
 ```bash
 node ./bin/main.js create \
@@ -222,11 +271,17 @@ If you only want one repaired shard written back out, add repeated `--missing-in
 
 ## Interoperability with PAR2
 
-`par3` consumes raw shard bytes. It does not parse `.par2` packet envelopes, so PAR2 recovery
-volumes must be unwrapped into raw shard payloads before you hand them to this repository.
+`par3` can now read and write a strict PAR2-style packet subset in porcelain mode. That packet
+layer carries the manifest, file descriptions, and recovery blocks directly, while the raw-shard
+mode remains available when you want slot-level control.
 
-For the data side, split the original file into fixed-size raw blocks that match `shard_size`, then
-copy each block into the `shard_<slot>.bin` naming scheme expected by the CLI and Worker:
+Because the repository still uses its native shard codec, the envelope layer is primarily intended
+for round trips through this codebase rather than claiming bit-for-bit parity compatibility with
+every legacy PAR2 implementation.
+
+If you need the previous slot-oriented workflow, split the original file into fixed-size raw blocks
+that match `shard_size`, then copy each block into the `shard_<slot>.bin` naming scheme expected by
+the raw CLI and Worker paths:
 
 ```bash
 split -b 65536 --numeric-suffixes=0 --suffix-length=3 ./archive.bin ./raw/shard_
@@ -243,8 +298,8 @@ of `shard_size`; it pads the final tail shard so every shard handed to `par3` is
 bytes long.
 
 For the parity side, first extract the raw recovery payloads from the `.par2` volumes with a
-packet-aware PAR2 tool. Once those payloads are unwrapped, copy each one into the matching recovery
-slot file that `par3` should see:
+packet-aware tool. Once those payloads are unwrapped, copy each one into the matching recovery
+slot file that the raw-shard workflow should see:
 
 ```bash
 cat ./unwrapped/recovery_000.bin > ./shards/shard_4.bin
@@ -253,15 +308,45 @@ cat ./unwrapped/recovery_001.bin > ./shards/shard_5.bin
 
 After both sides are in raw shard form, `par3 create` and `par3 repair` work on them directly.
 
+## Example worker
+
+`examples/fetch_encode_repair_gzip.js` is a self-contained edge example that imports `_worker.js`
+as an internal microservice. It demonstrates one fully streaming chain:
+
+- fetch a remote asset once
+- split it into fixed-size original shards
+- stream every original shard into `POST /` to generate recovery shards
+- intentionally omit the last one or two original shards from `PATCH /`
+- stream the surviving originals plus generated recovery shards into `PATCH /`
+- write the rebuilt tail directly into `CompressionStream("gzip")`
+
+Because the example chooses its shard layout up front, the upstream response must include a
+`Content-Length` header.
+
+To run the example locally, build the wasm package first and then point Wrangler at the example
+module instead of the default `_worker.js` entrypoint from `wrangler.toml`:
+
+```bash
+npm run build:wasm
+npx wrangler dev ./examples/fetch_encode_repair_gzip.js --local
+```
+
+Open Wrangler's local URL, submit a remote asset URL, and the example will stream back a gzip file
+whose tail was reconstructed through the repair path. The response also includes
+`x-demo-dropped-shards` so you can see which original shard indexes were intentionally omitted.
+
 ## Project layout
 
 - `src/lib.rs`: Rust codec core and wasm bindings
+- `lib/envelope.js`: strict PAR2/PAR3 packet parser/packer for the CLI porcelain layer
 - `lib/multipart.js`: generic RFC 7578 multipart protocol helpers
 - `lib/mod.js`: shared `Par3` shard repair/runtime abstraction
-- `_worker.js`: Cloudflare Worker immediate-return repair orchestration and stream lifetime management
+- `_worker.js`: Cloudflare Worker immediate-return POST/PATCH orchestration and stream lifetime management
+- `examples/fetch_encode_repair_gzip.js`: fetch-once encode/repair/gzip example built on `_worker.js`
 - `bin/main.js`: local CLI implementation and executable entrypoint
 - `_worker_test.js`: Worker property-style and protocol tests
 - `bin/main_test.js`: CLI behavior tests
+- `lib/envelope_test.js`: packet envelope tests
 - `lib/mod_test.js`: direct `Par3` class tests
 - `scripts/build-wasm.sh`: wasm build helper
 - `scripts/test-coverage.mjs`: built-in coverage gate for maintained JS files

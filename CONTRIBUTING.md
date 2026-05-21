@@ -38,9 +38,10 @@ The installed CLI entrypoint is `par3`, and the repository-local executable shim
   test runner.
 - CLI changes should be covered in `bin/main_test.js` and should prefer built-in Node facilities
   already available in the 26.x line when they simplify cleanup or mocking.
+- Packet-envelope changes should be covered in `lib/envelope_test.js`.
 - Shared `Par3` runtime changes should be covered directly in `lib/mod_test.js`.
-- `npm run test:coverage` must keep `_worker.js`, `bin/main.js`, `lib/mod.js`, and
-  `lib/multipart.js` at 100% line, branch, and function coverage.
+- `npm run test:coverage` must keep `_worker.js`, `bin/main.js`, `lib/envelope.js`,
+  `lib/mod.js`, and `lib/multipart.js` at 100% line, branch, and function coverage.
 
 ## Design constraints
 

@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "private": false,
   "type": "module",
+  "imports": {
+    "#worker": "./_worker.js",
+    "#lib/*": "./lib/*",
+    "#pkg/*": "./pkg/*"
+  },
   "description": "Streaming PAR3-style erasure coding for Cloudflare Workers and local Node.js repair workflows",
   "license": "MIT",
   "bin": {
@@ -18,9 +23,9 @@
     "deploy": "npm run build:wasm && wrangler deploy",
     "repair": "node ./bin/main.js repair",
     "test:rust": "cargo test --lib",
-    "test:js": "npm run build:wasm && node --experimental-wasm-modules --test _worker_test.js bin/main_test.js lib/mod_test.js lib/multipart_test.js",
+    "test:js": "npm run build:wasm && node --experimental-wasm-modules --test _worker_test.js bin/main_test.js examples/fetch_encode_repair_gzip_test.js lib/envelope_test.js lib/mod_test.js lib/multipart_test.js",
     "test": "npm run test:rust && npm run test:js",
-    "test:watch": "npm run build:wasm && node --experimental-wasm-modules --test --watch _worker_test.js bin/main_test.js lib/mod_test.js lib/multipart_test.js",
+    "test:watch": "npm run build:wasm && node --experimental-wasm-modules --test --watch _worker_test.js bin/main_test.js examples/fetch_encode_repair_gzip_test.js lib/envelope_test.js lib/mod_test.js lib/multipart_test.js",
     "test:coverage": "npm run build:wasm && node ./scripts/test-coverage.mjs"
   },
   "devDependencies": {
