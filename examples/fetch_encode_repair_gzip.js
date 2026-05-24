@@ -392,8 +392,10 @@ async function writeGzipChunk(writer, chunk, contentLength, emittedBytes) {
   return emittedBytes;
 }
 
-// Fan the upstream response into both internal requests while immediately sending the intact prefix
-// into gzip. The dropped originals are skipped here and reconstructed later by the repair leg.
+// Do not tee the upstream body. One reader fans each shard into encode, repair, and gzip in order.
+// Awaiting each write lets CompressionStream and the internal Worker apply native stream
+// backpressure to the upstream fetch while resident JS heap stays bounded to one partial shard plus
+// current chunks.
 async function streamSourceIntoPipelines({
   contentLength,
   droppedIndices,
@@ -589,8 +591,8 @@ async function startPipeline(sourceUrl, env, ctx) {
     r: String(recoveryCount),
     s: String(shardSize),
   });
-  // Both internal worker requests are started up front so their readable sides can apply
-  // backpressure as soon as the first shard bytes arrive.
+  // Start both internal requests up front. Their readable sides push pressure back through the
+  // writers below, so downstream TCP stalls slow the original fetch instead of filling the V8 heap.
   const encodeResponsePromise = worker.fetch(
     new Request(createInternalUrl(layoutSearch), {
       method: "POST",

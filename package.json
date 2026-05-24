@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "private": false,
   "type": "module",
+  "exports": {
+    ".": {
+      "workerd": "./lib/mod.js",
+      "browser": "./lib/mod.js",
+      "node": "./lib/mod.node.js",
+      "default": "./lib/mod.js"
+    }
+  },
   "imports": {
     "#worker": "./_worker.js",
     "#lib/*": "./lib/*",
@@ -16,19 +24,27 @@
   "engines": {
     "node": ">=26.1.0"
   },
+  "napi": {
+    "binaryName": "par3"
+  },
   "scripts": {
+    "benchmark": "npm run build:wasm && npm run build:native && node --experimental-wasm-modules ./scripts/benchmark.mjs",
     "build:wasm": "bash ./scripts/build-wasm.sh",
+    "build:native": "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_LTO=thin RUSTFLAGS=\"${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=native\" napi build --release --features napi --output-dir ./lib",
+    "build:native:debug": "RUSTFLAGS=\"${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=native\" napi build --features napi --output-dir ./lib",
     "build": "npm run build:wasm",
     "dev": "npm run build:wasm && wrangler dev",
     "deploy": "npm run build:wasm && wrangler deploy",
     "repair": "node ./bin/main.js repair",
     "test:rust": "cargo test --lib",
     "test:js": "npm run build:wasm && node --experimental-wasm-modules --test _worker_test.js bin/main_test.js examples/fetch_encode_repair_gzip_test.js lib/envelope_test.js lib/mod_test.js lib/multipart_test.js",
+    "test:native": "npm run build:native && node ./scripts/test-native-coverage.mjs",
     "test": "npm run test:rust && npm run test:js",
     "test:watch": "npm run build:wasm && node --experimental-wasm-modules --test --watch _worker_test.js bin/main_test.js examples/fetch_encode_repair_gzip_test.js lib/envelope_test.js lib/mod_test.js lib/multipart_test.js",
     "test:coverage": "npm run build:wasm && node ./scripts/test-coverage.mjs"
   },
   "devDependencies": {
+    "@napi-rs/cli": "^3.2.0",
     "wrangler": "^4.16.0"
   }
 }

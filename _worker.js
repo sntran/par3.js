@@ -68,6 +68,8 @@ function resolveOperation(request) {
     throw new HttpError(404, `unsupported path ${requestUrl.pathname}`);
   }
 
+  // Keep the resource path fixed. HTTP verbs select encode or repair, which keeps proxies and
+  // clients on one REST-style endpoint without path-specific stream handling.
   if (request.method === "POST") {
     return "encode";
   }
@@ -464,6 +466,8 @@ export default {
       const responseBoundary = `par3-${crypto.randomUUID()}`;
       const codec = new Par3(layout, { createError: badRequest });
       const { readable, writable } = new TransformStream();
+      // Tie wasm arena lifetime to the HTTP response, not to the background pump alone. A complete
+      // response flush and a client-side cancellation both release codec memory at the stream edge.
       const cleanupTransform = new TransformStream({
         flush() {
           codec.free();
@@ -479,6 +483,8 @@ export default {
           "content-type": `multipart/form-data; boundary=${responseBoundary}`,
         },
       });
+      // Return headers now. The promise below owns ingress, repair/encode, and multipart egress
+      // under waitUntil so the request path stays streaming instead of buffering the body.
       const operationPromise = operation === "encode"
         ? processEncodePipeline(
           request,

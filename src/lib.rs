@@ -34,6 +34,9 @@ use std::fmt::{Display, Formatter};
 use std::sync::{Mutex, OnceLock};
 use wasm_bindgen::prelude::*;
 
+#[cfg(feature = "napi")]
+mod napi;
+
 #[derive(Debug, Clone, Copy)]
 struct ShardArenaMeta {
     byte_len: usize,
